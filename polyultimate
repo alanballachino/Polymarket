@@ -1,0 +1,2787 @@
+#!/usr/bin/env python3
+"""
+POLYWATCH ULTIMATE - Polymarket Intelligence Scanner
+=====================================================
+Features:
+- Fresh wallet detection (insider alerts)
+- Price spike detection
+- Whale convergence alerts
+- Volume anomaly detection
+- Win rate tracking
+- Copy trading signals
+- New market scanner
+- Arbitrage finder
+- Time pattern analysis
+- CSV export
+- Discord/Telegram webhooks
+- Sound alerts
+
+Run: python polywatch.py
+"""
+
+import requests
+import json
+import time
+import csv
+import os
+import sys
+from datetime import datetime, timedelta
+from typing import Dict, List, Set, Optional, Any, Tuple
+from pathlib import Path
+from collections import defaultdict
+import threading
+
+# ============================================
+# CONFIGURATION  
+# ============================================
+
+CONFIG = {
+    "GAMMA_API": "https://gamma-api.polymarket.com",
+    "DATA_API": "https://data-api.polymarket.com",
+    
+    "POLL_INTERVAL_SEC": 45,          # Increased since we fetch more data
+    "MIN_TRADE_SIZE": 100,
+    
+    # Market scanning
+    "MAX_MARKET_PAGES": 50,           # Max pages to fetch (100 markets/page = 5000 max)
+    "MARKETS_TO_SCAN_TRADES": 30,     # How many markets to get trades from
+    "WALLETS_TO_SCAN": 25,            # How many wallets to get activity from
+    
+    # Alert thresholds
+    "WHALE_THRESHOLD": 5000,          # $5K+ = whale
+    "FRESH_WALLET_DAYS": 7,           # Wallet age to flag
+    "PRICE_SPIKE_PCT": 5,             # 5% move = spike
+    "VOLUME_ANOMALY_MULT": 3,         # 3x normal = anomaly
+    "CONVERGENCE_COUNT": 3,           # 3+ whales = convergence
+    
+    # Webhooks (set your URLs here)
+    "DISCORD_WEBHOOK": "",            # Discord webhook URL
+    "TELEGRAM_BOT_TOKEN": "",         # Telegram bot token
+    "TELEGRAM_CHAT_ID": "",           # Telegram chat ID
+    
+    # Sound alerts
+    "SOUND_ENABLED": False,           # Set to True to enable beeps
+}
+
+# ============================================
+# UNUSUAL ACTIVITY SCORE (UAS) ALGORITHM
+# ============================================
+# Combines multiple signals into a 0-100 score
+# Higher score = more unusual/interesting activity
+
+class UnusualActivityScorer:
+    """
+    Calculates an Unusual Activity Score (UAS) from 0-100 based on:
+    - Trade size relative to market average
+    - Fresh wallet involvement  
+    - Price movement velocity
+    - Volume anomalies
+    - Whale convergence
+    - Buy/sell imbalance
+    - Trade velocity (trades per minute)
+    """
+    
+    # Weights for each signal (must sum to 100)
+    WEIGHTS = {
+        "size_score": 20,        # Large trade relative to market
+        "fresh_wallet": 15,      # New wallet activity
+        "price_movement": 15,    # Recent price changes
+        "volume_anomaly": 15,    # Volume vs historical
+        "whale_activity": 15,    # Whale involvement
+        "imbalance": 10,         # Buy/sell imbalance
+        "velocity": 10,          # Trade frequency
+    }
+    
+    @staticmethod
+    def calculate_trade_score(trade: Dict, market_data: Dict, sentiment: Dict) -> Dict:
+        """Calculate UAS for a single trade"""
+        scores = {}
+        
+        # 1. SIZE SCORE (0-100): How big is this trade?
+        size = trade.get("size", 0)
+        avg_trade_size = sentiment.get("avg_trade_size", 500)
+        if avg_trade_size > 0:
+            size_ratio = size / avg_trade_size
+            # Score: 1x avg = 20, 5x avg = 60, 10x+ avg = 100
+            scores["size_score"] = min(100, size_ratio * 20)
+        else:
+            scores["size_score"] = min(100, size / 100)  # Fallback
+        
+        # 2. FRESH WALLET SCORE (0-100): Is wallet new?
+        wallet = trade.get("wallet", "")
+        first_seen = wallet_first_seen.get(wallet)
+        if first_seen:
+            try:
+                age_days = (datetime.now() - datetime.fromisoformat(first_seen.replace("Z", "+00:00")).replace(tzinfo=None)).days
+                if age_days <= 1:
+                    scores["fresh_wallet"] = 100
+                elif age_days <= 7:
+                    scores["fresh_wallet"] = 80 - (age_days * 10)
+                elif age_days <= 30:
+                    scores["fresh_wallet"] = 30 - age_days
+                else:
+                    scores["fresh_wallet"] = 0
+            except:
+                scores["fresh_wallet"] = 50  # Unknown age
+        else:
+            scores["fresh_wallet"] = 100  # Never seen = very fresh
+        
+        # Bonus if fresh wallet + big trade
+        if scores["fresh_wallet"] > 50 and size >= CONFIG["WHALE_THRESHOLD"]:
+            scores["fresh_wallet"] = min(100, scores["fresh_wallet"] + 20)
+        
+        # 3. PRICE MOVEMENT SCORE (0-100): Recent price volatility
+        market_id = trade.get("market_id", "")
+        history = price_history.get(market_id, [])
+        if len(history) >= 3:
+            prices = [h.get("price", 0.5) for h in history[-10:]]
+            if prices and prices[0] > 0:
+                price_change = abs(prices[-1] - prices[0]) / prices[0] * 100
+                # Score: 2% change = 40, 5% = 100
+                scores["price_movement"] = min(100, price_change * 20)
+            else:
+                scores["price_movement"] = 0
+        else:
+            scores["price_movement"] = 0
+        
+        # 4. VOLUME ANOMALY SCORE (0-100): Current vs historical volume
+        vol_history = volume_history.get(market_id, [])
+        if len(vol_history) >= 3:
+            volumes = [v for t, v in vol_history if isinstance(v, (int, float))]
+            if volumes:
+                avg_vol = sum(volumes) / len(volumes)
+                current_vol = sentiment.get("total_volume", 0)
+                if avg_vol > 0:
+                    vol_ratio = current_vol / avg_vol
+                    # Score: 1x = 20, 3x = 60, 5x+ = 100
+                    scores["volume_anomaly"] = min(100, vol_ratio * 20)
+                else:
+                    scores["volume_anomaly"] = 0
+            else:
+                scores["volume_anomaly"] = 0
+        else:
+            scores["volume_anomaly"] = 0
+        
+        # 5. WHALE ACTIVITY SCORE (0-100): Recent whale involvement
+        recent_whales = recent_whale_buys.get(market_id, [])
+        whale_count = len(set(w for w, s, t in recent_whales))
+        whale_volume = sum(s for w, s, t in recent_whales)
+        
+        # Score: 1 whale = 30, 2 = 60, 3+ = 100
+        scores["whale_activity"] = min(100, whale_count * 33)
+        
+        # Bonus for current trade being whale-sized
+        if size >= CONFIG["WHALE_THRESHOLD"]:
+            scores["whale_activity"] = min(100, scores["whale_activity"] + 30)
+        
+        # 6. IMBALANCE SCORE (0-100): Buy vs Sell pressure
+        buy_vol = sentiment.get("buy_volume", 0)
+        sell_vol = sentiment.get("sell_volume", 0)
+        total_vol = buy_vol + sell_vol
+        if total_vol > 0:
+            imbalance = abs(buy_vol - sell_vol) / total_vol
+            # Score: 50/50 = 0, 70/30 = 40, 90/10 = 80, 100/0 = 100
+            scores["imbalance"] = imbalance * 100
+        else:
+            scores["imbalance"] = 0
+        
+        # 7. VELOCITY SCORE (0-100): Trades per minute
+        recent_trades = sentiment.get("recent_trades", [])
+        if len(recent_trades) >= 2:
+            try:
+                times = []
+                for t in recent_trades[-20:]:
+                    ts = t.get("timestamp", "")
+                    if ts:
+                        times.append(datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None))
+                
+                if len(times) >= 2:
+                    time_span = (max(times) - min(times)).total_seconds() / 60  # minutes
+                    if time_span > 0:
+                        trades_per_min = len(times) / time_span
+                        # Score: 1/min = 20, 5/min = 100
+                        scores["velocity"] = min(100, trades_per_min * 20)
+                    else:
+                        scores["velocity"] = 100  # All in same minute = very high velocity
+                else:
+                    scores["velocity"] = 0
+            except:
+                scores["velocity"] = 0
+        else:
+            scores["velocity"] = 0
+        
+        # Calculate weighted total
+        total_score = sum(
+            scores.get(key, 0) * (weight / 100)
+            for key, weight in UnusualActivityScorer.WEIGHTS.items()
+        )
+        
+        return {
+            "total": round(total_score, 1),
+            "components": scores,
+            "trade": trade,
+            "market_id": market_id,
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    @staticmethod
+    def calculate_market_score(market_id: str) -> Dict:
+        """Calculate overall UAS for a market"""
+        sentiment = market_sentiment.get(market_id, {})
+        market_data = market_cache.get(market_id, {})
+        
+        scores = {}
+        
+        # Price volatility
+        history = price_history.get(market_id, [])
+        if len(history) >= 5:
+            prices = [h.get("price", 0.5) for h in history]
+            if prices and min(prices) > 0:
+                volatility = (max(prices) - min(prices)) / min(prices) * 100
+                scores["volatility"] = min(100, volatility * 10)
+            else:
+                scores["volatility"] = 0
+        else:
+            scores["volatility"] = 0
+        
+        # Volume trend
+        vol_history = volume_history.get(market_id, [])
+        if len(vol_history) >= 3:
+            vols = [v for t, v in vol_history if isinstance(v, (int, float))]
+            if len(vols) >= 2:
+                recent_avg = sum(vols[-3:]) / min(3, len(vols[-3:]))
+                older_avg = sum(vols[:-3]) / max(1, len(vols[:-3])) if len(vols) > 3 else recent_avg
+                if older_avg > 0:
+                    vol_growth = recent_avg / older_avg
+                    scores["volume_trend"] = min(100, vol_growth * 25)
+                else:
+                    scores["volume_trend"] = 50
+            else:
+                scores["volume_trend"] = 0
+        else:
+            scores["volume_trend"] = 0
+        
+        # Whale concentration
+        recent_whales = recent_whale_buys.get(market_id, [])
+        unique_whales = len(set(w for w, s, t in recent_whales))
+        scores["whale_concentration"] = min(100, unique_whales * 33)
+        
+        # Trade activity
+        trade_count = sentiment.get("buy_count", 0) + sentiment.get("sell_count", 0)
+        scores["activity"] = min(100, trade_count * 5)
+        
+        # Buy pressure
+        buy_vol = sentiment.get("buy_volume", 0)
+        sell_vol = sentiment.get("sell_volume", 0)
+        total = buy_vol + sell_vol
+        if total > 0:
+            buy_pct = buy_vol / total * 100
+            scores["buy_pressure"] = buy_pct
+        else:
+            scores["buy_pressure"] = 50
+        
+        # Fresh wallet involvement
+        unique_buyers = sentiment.get("unique_buyers", set())
+        fresh_count = sum(1 for w in unique_buyers if is_fresh_wallet(w))
+        if len(unique_buyers) > 0:
+            fresh_pct = fresh_count / len(unique_buyers) * 100
+            scores["fresh_involvement"] = fresh_pct
+        else:
+            scores["fresh_involvement"] = 0
+        
+        # Calculate weighted total
+        weights = {
+            "volatility": 20,
+            "volume_trend": 20,
+            "whale_concentration": 20,
+            "activity": 15,
+            "buy_pressure": 15,
+            "fresh_involvement": 10,
+        }
+        
+        total_score = sum(
+            scores.get(key, 0) * (weight / 100)
+            for key, weight in weights.items()
+        )
+        
+        return {
+            "market_id": market_id,
+            "total": round(total_score, 1),
+            "components": scores,
+            "market_name": market_data.get("question", "?"),
+            "timestamp": datetime.now().isoformat()
+        }
+    
+    @staticmethod
+    def get_score_label(score: float) -> str:
+        """Convert score to human-readable label"""
+        if score >= 80:
+            return "🔴 EXTREME"
+        elif score >= 60:
+            return "🟠 HIGH"
+        elif score >= 40:
+            return "🟡 ELEVATED"
+        elif score >= 20:
+            return "🟢 MODERATE"
+        else:
+            return "⚪ LOW"
+    
+    @staticmethod
+    def get_score_color(score: float) -> str:
+        """Get terminal color for score"""
+        if score >= 80:
+            return C.RED
+        elif score >= 60:
+            return C.YELLOW
+        elif score >= 40:
+            return C.CYAN
+        else:
+            return C.GRAY
+
+# Global instance
+uas_scorer = UnusualActivityScorer()
+
+# Store recent UAS calculations
+market_uas_scores: Dict[str, Dict] = {}
+trade_uas_history: List[Dict] = []
+
+# ============================================
+# COLORS
+# ============================================
+
+class C:
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    MAGENTA = '\033[95m'
+    WHITE = '\033[97m'
+    GRAY = '\033[90m'
+    BOLD = '\033[1m'
+    R = '\033[0m'
+    
+    # Background colors for alerts
+    BG_RED = '\033[41m'
+    BG_GREEN = '\033[42m'
+    BG_YELLOW = '\033[43m'
+    BG_BLUE = '\033[44m'
+
+def log(msg: str, level: str = "info"):
+    ts = datetime.now().strftime("%H:%M:%S")
+    colors = {"info": C.CYAN, "success": C.GREEN, "warn": C.YELLOW, "error": C.RED, "alert": C.MAGENTA}
+    print(f"{colors.get(level, C.CYAN)}[{ts}]{C.R} {msg}")
+
+# ============================================
+# STATE
+# ============================================
+
+seen_trades: Set[str] = set()
+all_trades: List[Dict] = []
+discovered_wallets: Set[str] = set()
+market_cache: Dict[str, Dict] = {}
+loop_count = 0
+
+# Tracking data
+wallet_stats: Dict[str, Dict] = {}
+market_sentiment: Dict[str, Dict] = {}
+price_history: Dict[str, List] = defaultdict(list)  # market_id -> [(timestamp, price)]
+volume_history: Dict[str, List] = defaultdict(list)  # market_id -> [(timestamp, volume)]
+wallet_first_seen: Dict[str, str] = {}  # wallet -> first trade timestamp
+resolved_markets: Dict[str, Dict] = {}  # market_id -> resolution data
+wallet_resolved_trades: Dict[str, List] = defaultdict(list)  # wallet -> resolved trade results
+
+# Alerts
+alerts: List[Dict] = []
+recent_whale_buys: Dict[str, List] = defaultdict(list)  # market_id -> [(wallet, size, timestamp)]
+seen_alerts: Set[str] = set()  # Track seen alerts to avoid duplicates
+price_spike_cooldown: Dict[str, str] = {}  # market_id -> last alert timestamp
+
+# Time patterns
+hourly_volume: Dict[int, float] = defaultdict(float)  # hour -> total volume
+hourly_trades: Dict[int, int] = defaultdict(int)  # hour -> trade count
+
+# ============================================
+# SOUND ALERTS
+# ============================================
+
+def play_alert_sound(alert_type: str = "whale"):
+    """Play alert sound (cross-platform)"""
+    if not CONFIG["SOUND_ENABLED"]:
+        return
+    
+    try:
+        if sys.platform == "win32":
+            import winsound
+            if alert_type == "whale":
+                winsound.Beep(800, 300)
+                winsound.Beep(1000, 300)
+            elif alert_type == "insider":
+                winsound.Beep(1200, 200)
+                winsound.Beep(1200, 200)
+                winsound.Beep(1200, 200)
+            elif alert_type == "spike":
+                winsound.Beep(600, 500)
+        else:
+            # Unix - try terminal bell
+            print('\a', end='', flush=True)
+    except:
+        pass
+
+# ============================================
+# WEBHOOK NOTIFICATIONS
+# ============================================
+
+def send_discord_alert(message: str):
+    """Send alert to Discord webhook"""
+    if not CONFIG["DISCORD_WEBHOOK"]:
+        return
+    
+    try:
+        requests.post(CONFIG["DISCORD_WEBHOOK"], json={
+            "content": message,
+            "username": "PolyWatch Alert"
+        }, timeout=5)
+    except:
+        pass
+
+def send_telegram_alert(message: str):
+    """Send alert to Telegram"""
+    if not CONFIG["TELEGRAM_BOT_TOKEN"] or not CONFIG["TELEGRAM_CHAT_ID"]:
+        return
+    
+    try:
+        url = f"https://api.telegram.org/bot{CONFIG['TELEGRAM_BOT_TOKEN']}/sendMessage"
+        requests.post(url, json={
+            "chat_id": CONFIG["TELEGRAM_CHAT_ID"],
+            "text": message,
+            "parse_mode": "HTML"
+        }, timeout=5)
+    except:
+        pass
+
+def broadcast_alert(alert: Dict):
+    """Send alert to all configured channels"""
+    alert_type = alert.get('type', 'ALERT')
+    alert_msg = alert.get('message', 'No details')
+    
+    # Create a dedup key (market_id + type + rough time)
+    market_id = alert.get('market_id', '')
+    wallet = alert.get('wallet', '')
+    dedup_key = f"{alert_type}_{market_id}_{wallet}"
+    
+    # Skip if we've seen this alert recently
+    if dedup_key in seen_alerts:
+        return
+    seen_alerts.add(dedup_key)
+    
+    # Clean up old alerts (keep last 500)
+    if len(seen_alerts) > 500:
+        seen_alerts.clear()
+    
+    msg = f"🚨 {alert_type}: {alert_msg}"
+    
+    # Add to alerts list
+    alerts.append(alert)
+    if len(alerts) > 100:
+        alerts.pop(0)
+    
+    # Send to webhooks (async to not block)
+    threading.Thread(target=send_discord_alert, args=(msg,), daemon=True).start()
+    threading.Thread(target=send_telegram_alert, args=(msg,), daemon=True).start()
+    
+    # Play sound
+    play_alert_sound(alert.get("sound", "whale"))
+
+# ============================================
+# PERSISTENCE
+# ============================================
+
+def load_all_data():
+    """Load all saved data"""
+    global wallet_stats, market_sentiment, price_history, wallet_first_seen, resolved_markets, wallet_resolved_trades, hourly_volume, hourly_trades
+    
+    try:
+        if Path("polywatch-wallets.json").exists():
+            wallet_stats = json.loads(Path("polywatch-wallets.json").read_text())
+            log(f"Loaded {len(wallet_stats)} wallets", "success")
+    except: pass
+    
+    try:
+        if Path("polywatch-markets.json").exists():
+            market_sentiment = json.loads(Path("polywatch-markets.json").read_text())
+            log(f"Loaded {len(market_sentiment)} markets", "success")
+    except: pass
+    
+    try:
+        if Path("polywatch-prices.json").exists():
+            data = json.loads(Path("polywatch-prices.json").read_text())
+            for k, v in data.items():
+                price_history[k] = v
+            log(f"Loaded price history for {len(price_history)} markets", "success")
+    except: pass
+    
+    try:
+        if Path("polywatch-wallet-ages.json").exists():
+            wallet_first_seen.update(json.loads(Path("polywatch-wallet-ages.json").read_text()))
+    except: pass
+    
+    try:
+        if Path("polywatch-resolved.json").exists():
+            resolved_markets.update(json.loads(Path("polywatch-resolved.json").read_text()))
+    except: pass
+    
+    try:
+        if Path("polywatch-winrates.json").exists():
+            data = json.loads(Path("polywatch-winrates.json").read_text())
+            for k, v in data.items():
+                wallet_resolved_trades[k] = v
+    except: pass
+    
+    try:
+        if Path("polywatch-time-patterns.json").exists():
+            data = json.loads(Path("polywatch-time-patterns.json").read_text())
+            for k, v in data.get("hourly_volume", {}).items():
+                hourly_volume[int(k)] = v
+            for k, v in data.get("hourly_trades", {}).items():
+                hourly_trades[int(k)] = v
+    except: pass
+
+def save_all_data():
+    """Save all data to files"""
+    try:
+        Path("polywatch-wallets.json").write_text(json.dumps(wallet_stats, indent=2))
+    except: pass
+    
+    try:
+        # Convert sets to lists for JSON
+        save_sentiment = {}
+        for mid, sent in market_sentiment.items():
+            save_sent = sent.copy()
+            if isinstance(save_sent.get("unique_buyers"), set):
+                save_sent["unique_buyers"] = list(save_sent["unique_buyers"])
+            if isinstance(save_sent.get("unique_sellers"), set):
+                save_sent["unique_sellers"] = list(save_sent["unique_sellers"])
+            save_sentiment[mid] = save_sent
+        Path("polywatch-markets.json").write_text(json.dumps(save_sentiment, indent=2))
+    except: pass
+    
+    try:
+        # Save recent price history only
+        save_prices = {k: v[-100:] for k, v in price_history.items()}
+        Path("polywatch-prices.json").write_text(json.dumps(save_prices, indent=2))
+    except: pass
+    
+    try:
+        Path("polywatch-wallet-ages.json").write_text(json.dumps(wallet_first_seen, indent=2))
+    except: pass
+    
+    try:
+        Path("polywatch-resolved.json").write_text(json.dumps(resolved_markets, indent=2))
+    except: pass
+    
+    try:
+        Path("polywatch-winrates.json").write_text(json.dumps(dict(wallet_resolved_trades), indent=2))
+    except: pass
+    
+    try:
+        Path("polywatch-time-patterns.json").write_text(json.dumps({
+            "hourly_volume": dict(hourly_volume),
+            "hourly_trades": dict(hourly_trades)
+        }, indent=2))
+    except: pass
+
+# ============================================
+# CSV EXPORT
+# ============================================
+
+def export_trades_csv():
+    """Export all trades to CSV with complete Polymarket data"""
+    filename = f"polywatch-trades-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+    try:
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            # Full header with all essential Polymarket fields
+            writer.writerow([
+                'Timestamp', 'Wallet', 'Trader_Name', 'Side', 'Outcome', 'Outcome_Index',
+                'Size_USD', 'Price', 'Market_Title', 'Market_ID', 'Event_Slug', 'Market_Slug',
+                'Asset_ID', 'Fee', 'Transaction_Hash'
+            ])
+            for t in all_trades:
+                writer.writerow([
+                    t.get('timestamp', ''),
+                    t.get('wallet', ''),
+                    t.get('trader_name', ''),
+                    t.get('side', ''),
+                    t.get('outcome', ''),
+                    t.get('outcome_index', ''),
+                    t.get('size', 0),
+                    t.get('price', 0),
+                    t.get('market', ''),
+                    t.get('market_id', ''),
+                    t.get('event_slug', ''),
+                    t.get('market_slug', ''),
+                    t.get('asset_id', ''),
+                    t.get('fee', 0),
+                    t.get('transaction_hash', ''),
+                ])
+        log(f"Exported {len(all_trades)} trades to {filename}", "success")
+        return filename
+    except Exception as e:
+        log(f"Export failed: {e}", "error")
+        return None
+
+def export_leaderboard_csv():
+    """Export wallet leaderboard to CSV"""
+    filename = f"polywatch-leaderboard-{datetime.now().strftime('%Y%m%d-%H%M%S')}.csv"
+    try:
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Wallet', 'Total Volume', 'Trades', 'Buy Volume', 'Sell Volume', 
+                           'Win Rate', 'Wins', 'Losses', 'Largest Trade', 'First Seen'])
+            for addr, stats in sorted(wallet_stats.items(), key=lambda x: x[1].get('total_volume', 0), reverse=True):
+                win_data = get_wallet_win_rate(addr)
+                writer.writerow([
+                    addr,
+                    stats.get('total_volume', 0),
+                    stats.get('trade_count', 0),
+                    stats.get('buy_volume', 0),
+                    stats.get('sell_volume', 0),
+                    f"{win_data['win_rate']:.1%}" if win_data['total'] > 0 else 'N/A',
+                    win_data['wins'],
+                    win_data['losses'],
+                    stats.get('largest_trade', 0),
+                    stats.get('first_seen', '')
+                ])
+        log(f"Exported {len(wallet_stats)} wallets to {filename}", "success")
+        return filename
+    except Exception as e:
+        log(f"Export failed: {e}", "error")
+        return None
+
+# ============================================
+# API FUNCTIONS
+# ============================================
+
+def api_get(url: str, params: dict = None) -> Optional[Any]:
+    try:
+        resp = requests.get(url, params=params, timeout=20, 
+                          headers={"Accept": "application/json", "Content-Type": "application/json"})
+        if resp.status_code == 200:
+            return resp.json()
+        return None
+    except:
+        return None
+
+def get_markets() -> List[Dict]:
+    """Get ALL active markets by paginating through the API"""
+    all_markets = []
+    seen_ids = set()
+    
+    # Paginate through all markets
+    offset = 0
+    limit = 100
+    max_pages = CONFIG["MAX_MARKET_PAGES"]
+    
+    log(f"Fetching ALL markets...", "info")
+    
+    for page in range(max_pages):
+        data = api_get(f"{CONFIG['GAMMA_API']}/markets", {
+            "active": "true",
+            "closed": "false",
+            "limit": str(limit),
+            "offset": str(offset),
+        })
+        
+        if not data or len(data) == 0:
+            break
+        
+        for m in data:
+            cid = m.get("conditionId")
+            if cid and cid not in seen_ids:
+                seen_ids.add(cid)
+                all_markets.append(m)
+        
+        log(f"  Page {page + 1}: got {len(data)} markets (total: {len(all_markets)})", "info")
+        
+        # If we got less than limit, we've hit the end
+        if len(data) < limit:
+            break
+        
+        offset += limit
+        time.sleep(0.1)  # Be nice to the API
+    
+    # Also get recently closed markets (for resolution tracking)
+    data = api_get(f"{CONFIG['GAMMA_API']}/markets", {
+        "closed": "true",
+        "limit": "100",
+        "order": "endDate",
+        "ascending": "false"
+    })
+    if data:
+        closed_count = 0
+        for m in data:
+            cid = m.get("conditionId")
+            if cid and cid not in seen_ids:
+                seen_ids.add(cid)
+                all_markets.append(m)
+                closed_count += 1
+        if closed_count > 0:
+            log(f"  Added {closed_count} recently closed markets", "info")
+    
+    log(f"Total: {len(all_markets)} unique markets", "success")
+    return all_markets
+
+def get_market_trades(condition_id: str, limit: int = 50) -> List[Dict]:
+    data = api_get(f"{CONFIG['DATA_API']}/trades", {"market": condition_id, "limit": str(limit)})
+    return data if isinstance(data, list) else []
+
+def get_market_holders(condition_id: str, token_id: str) -> List[Dict]:
+    data = api_get(f"{CONFIG['DATA_API']}/holders", {"market": condition_id, "token_id": token_id, "limit": "50"})
+    return data if isinstance(data, list) else []
+
+def get_wallet_activity(wallet: str, limit: int = 30) -> List[Dict]:
+    data = api_get(f"{CONFIG['DATA_API']}/activity", {"user": wallet, "limit": str(limit)})
+    return data if isinstance(data, list) else []
+
+def get_wallet_positions(wallet: str) -> List[Dict]:
+    data = api_get(f"{CONFIG['DATA_API']}/positions", {"user": wallet, "sizeThreshold": "10"})
+    return data if isinstance(data, list) else []
+
+def get_closed_markets() -> List[Dict]:
+    """Get recently closed/resolved markets"""
+    data = api_get(f"{CONFIG['GAMMA_API']}/markets", {
+        "closed": "true", "limit": "50", "order": "endDate", "ascending": "false"
+    })
+    return data or []
+
+def get_polymarket_leaderboard(
+    category: str = "OVERALL",
+    time_period: str = "WEEK",
+    order_by: str = "PNL",
+    limit: int = 25
+) -> List[Dict]:
+    """
+    Get official Polymarket trader leaderboard
+    
+    Args:
+        category: OVERALL, POLITICS, SPORTS, CRYPTO, CULTURE, MENTIONS, WEATHER, ECONOMICS, TECH, FINANCE
+        time_period: DAY, WEEK, MONTH, ALL
+        order_by: PNL (profit/loss) or VOL (volume)
+        limit: 1-50
+    
+    Returns:
+        List of traders with: rank, proxyWallet, userName, vol, pnl, xUsername, verifiedBadge
+    """
+    data = api_get(f"{CONFIG['DATA_API']}/v1/leaderboard", {
+        "category": category.upper(),
+        "timePeriod": time_period.upper(),
+        "orderBy": order_by.upper(),
+        "limit": str(min(limit, 50))
+    })
+    return data if isinstance(data, list) else []
+
+# ============================================
+# NEW: TRADER PNL & CATEGORY TRACKING
+# ============================================
+
+def get_wallet_pnl(wallet: str) -> Dict:
+    """Get comprehensive P&L data for a wallet"""
+    default_result = {
+        "total_pnl": 0, 
+        "realized_pnl": 0, 
+        "unrealized_pnl": 0, 
+        "position_count": 0,
+        "positions": []
+    }
+    
+    try:
+        positions = api_get(f"{CONFIG['DATA_API']}/positions", {
+            "user": wallet,
+            "sizeThreshold": "1",
+            "sortBy": "CASHPNL",
+            "sortDirection": "DESC"
+        })
+        
+        if not positions or not isinstance(positions, list):
+            return default_result
+        
+        total_cash_pnl = 0
+        total_realized = 0
+        total_unrealized = 0
+        position_details = []
+        
+        for p in positions:
+            cash_pnl = float(p.get("cashPnl", 0) or 0)
+            realized = float(p.get("realizedPnl", 0) or 0)
+            current_val = float(p.get("currentValue", 0) or 0)
+            initial_val = float(p.get("initialValue", 0) or 0)
+            
+            total_cash_pnl += cash_pnl
+            total_realized += realized
+            total_unrealized += (current_val - initial_val)
+            
+            position_details.append({
+                "market": p.get("title", "?"),
+                "slug": p.get("slug", ""),
+                "outcome": p.get("outcome", "?"),
+                "size": p.get("size", 0),
+                "avg_price": p.get("avgPrice", 0),
+                "current_price": p.get("curPrice", 0),
+                "cash_pnl": cash_pnl,
+                "percent_pnl": float(p.get("percentPnl", 0) or 0),
+                "realized_pnl": realized,
+                "initial_value": initial_val,
+                "current_value": current_val,
+                "redeemable": p.get("redeemable", False),
+            })
+        
+        return {
+            "total_pnl": total_cash_pnl,
+            "realized_pnl": total_realized,
+            "unrealized_pnl": total_unrealized,
+            "position_count": len(positions),
+            "positions": position_details[:20]  # Top 20
+        }
+    except Exception as e:
+        log(f"Error getting wallet PnL: {e}", "debug")
+        return default_result
+
+def get_market_tags() -> Dict[str, List[Dict]]:
+    """Get all available market tags/categories"""
+    data = api_get(f"{CONFIG['GAMMA_API']}/tags", {})
+    
+    tags = {}
+    if data and isinstance(data, list):
+        for tag in data:
+            tag_id = str(tag.get("id", ""))
+            if tag_id:
+                tags[tag_id] = {
+                    "id": tag_id,
+                    "label": tag.get("label", ""),
+                    "slug": tag.get("slug", ""),
+                }
+    return tags
+
+def get_markets_by_category(tag_id: str, limit: int = 50) -> List[Dict]:
+    """Get markets filtered by category tag"""
+    data = api_get(f"{CONFIG['GAMMA_API']}/markets", {
+        "tag_id": tag_id,
+        "closed": "false",
+        "limit": str(limit)
+    })
+    return data if isinstance(data, list) else []
+
+# Global storage for category tracking
+market_categories: Dict[str, List[str]] = {}  # market_id -> [category_slugs]
+wallet_category_pnl: Dict[str, Dict[str, Dict]] = defaultdict(lambda: defaultdict(lambda: {
+    "wins": 0, "losses": 0, "total_pnl": 0, "trade_count": 0
+}))  # wallet -> category -> stats
+
+def update_market_categories(markets: List[Dict]):
+    """Extract and store category info for markets"""
+    for m in markets:
+        cid = m.get("conditionId", "")
+        if not cid:
+            continue
+        
+        tags = m.get("tags", [])
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except:
+                tags = []
+        
+        categories = []
+        for t in tags:
+            if isinstance(t, dict):
+                slug = t.get("slug") or t.get("label") or ""
+                if slug:
+                    categories.append(slug.lower())
+            elif isinstance(t, str):
+                categories.append(t.lower())
+        
+        if categories:
+            market_categories[cid] = categories
+
+def track_category_performance(wallet: str, market_id: str, pnl: float, won: bool):
+    """Track win/loss by category for a wallet"""
+    categories = market_categories.get(market_id, ["unknown"])
+    
+    for cat in categories:
+        stats = wallet_category_pnl[wallet][cat]
+        if won:
+            stats["wins"] += 1
+        else:
+            stats["losses"] += 1
+        stats["total_pnl"] += pnl
+        stats["trade_count"] += 1
+
+def get_wallet_category_stats(wallet: str) -> Dict[str, Dict]:
+    """Get win rate breakdown by category for a wallet"""
+    stats = wallet_category_pnl.get(wallet, {})
+    
+    result = {}
+    for cat, data in stats.items():
+        total = data["wins"] + data["losses"]
+        win_rate = data["wins"] / total if total > 0 else 0
+        result[cat] = {
+            "category": cat,
+            "win_rate": win_rate,
+            "wins": data["wins"],
+            "losses": data["losses"],
+            "total_pnl": data["total_pnl"],
+            "trade_count": data["trade_count"],
+        }
+    
+    return result
+
+# ============================================
+# HELPER FUNCTIONS
+# ============================================
+
+def parse_price(prices) -> float:
+    if not prices:
+        return 0.5
+    try:
+        if isinstance(prices, str):
+            prices = json.loads(prices)
+        if isinstance(prices, list) and len(prices) > 0:
+            return float(prices[0])
+    except:
+        pass
+    return 0.5
+
+def fmt_money(v) -> str:
+    """Format money value safely"""
+    if v is None:
+        return "$0"
+    try:
+        v = float(v)
+        if abs(v) >= 1_000_000:
+            return f"${v/1_000_000:.1f}M"
+        elif abs(v) >= 1000:
+            return f"${v/1000:.1f}K"
+        else:
+            return f"${v:.0f}"
+    except (ValueError, TypeError):
+        return "$0"
+
+def fmt_price(p) -> str:
+    """Format price as cents safely"""
+    if p is None:
+        return "0¢"
+    try:
+        p = float(p)
+        return f"{p*100:.0f}¢"
+    except (ValueError, TypeError):
+        return "0¢"
+
+def fmt_time(ts) -> str:
+    """Format timestamp for display"""
+    if not ts:
+        return ""
+    try:
+        # Handle Unix timestamp (seconds or milliseconds)
+        if isinstance(ts, (int, float)):
+            # If it looks like milliseconds, convert
+            if ts > 1e12:
+                ts = ts / 1000
+            dt = datetime.fromtimestamp(ts)
+        elif isinstance(ts, str):
+            # Try parsing as number first (Unix timestamp as string)
+            try:
+                ts_num = float(ts)
+                if ts_num > 1e12:
+                    ts_num = ts_num / 1000
+                dt = datetime.fromtimestamp(ts_num)
+            except ValueError:
+                # Parse ISO format timestamp
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                # Convert to local-ish display (just remove timezone for display)
+                dt = dt.replace(tzinfo=None)
+        else:
+            dt = ts
+        
+        now = datetime.now()
+        diff = now - dt
+        
+        # If today, show time only
+        if dt.date() == now.date():
+            return dt.strftime("%H:%M")
+        # If yesterday
+        elif diff.days == 1:
+            return f"Yesterday {dt.strftime('%H:%M')}"
+        # If within last 7 days, show day name
+        elif diff.days < 7:
+            return dt.strftime("%a %H:%M")
+        # Otherwise show date
+        else:
+            return dt.strftime("%m/%d %H:%M")
+    except:
+        return ""
+
+def fmt_time_full(ts) -> str:
+    """Format timestamp with full date and time"""
+    if not ts:
+        return "Unknown time"
+    try:
+        # Handle Unix timestamp
+        if isinstance(ts, (int, float)):
+            if ts > 1e12:
+                ts = ts / 1000
+            dt = datetime.fromtimestamp(ts)
+        elif isinstance(ts, str):
+            try:
+                ts_num = float(ts)
+                if ts_num > 1e12:
+                    ts_num = ts_num / 1000
+                dt = datetime.fromtimestamp(ts_num)
+            except ValueError:
+                dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                dt = dt.replace(tzinfo=None)
+        else:
+            dt = ts
+        return dt.strftime("%Y-%m-%d %H:%M:%S")
+    except:
+        return "Unknown time"
+
+def get_wallet_age_days(wallet: str) -> Optional[int]:
+    """Get wallet age in days"""
+    if wallet in wallet_first_seen:
+        try:
+            first_str = wallet_first_seen[wallet]
+            first = datetime.fromisoformat(first_str.replace("Z", "+00:00"))
+            # Make comparison timezone-naive
+            first_naive = first.replace(tzinfo=None)
+            return (datetime.now() - first_naive).days
+        except:
+            pass
+    return None
+
+def is_fresh_wallet(wallet: str) -> bool:
+    """Check if wallet is fresh (new)"""
+    age = get_wallet_age_days(wallet)
+    if age is None:
+        return False  # Unknown = don't flag (avoid false positives on first run)
+    return age < CONFIG["FRESH_WALLET_DAYS"]
+
+# ============================================
+# WIN RATE TRACKING
+# ============================================
+
+def check_resolved_markets():
+    """Check for newly resolved markets and calculate win/loss"""
+    closed = get_closed_markets()
+    
+    for m in closed[:20]:
+        cid = m.get("conditionId", "")
+        if not cid or cid in resolved_markets:
+            continue
+        
+        # Check if resolved
+        resolution_source = m.get("resolutionSource")
+        if not resolution_source:
+            continue
+        
+        # Get winning outcome (simplified - YES wins if price > 0.95)
+        yes_price = parse_price(m.get("outcomePrices"))
+        winner = "YES" if yes_price > 0.95 else "NO" if yes_price < 0.05 else None
+        
+        if not winner:
+            continue
+        
+        resolved_markets[cid] = {
+            "question": m.get("question", "?"),
+            "winner": winner,
+            "resolved_at": datetime.now().isoformat()
+        }
+        
+        # Update wallet win/loss records
+        if cid in market_sentiment:
+            sent = market_sentiment[cid]
+            for trade in sent.get("recent_trades", []):
+                wallet = trade.get("wallet", "")
+                side = trade.get("side", "")
+                outcome = trade.get("outcome", "")
+                size = trade.get("size", 0)
+                
+                if not wallet or not side:
+                    continue
+                
+                # Determine if trade was winner
+                # BUY YES wins if YES wins, BUY NO wins if NO wins
+                trade_won = (side == "BUY" and outcome == winner) or (side == "SELL" and outcome != winner)
+                
+                # Calculate estimated PnL for this trade
+                price = trade.get("price", 0.5)
+                if trade_won:
+                    # Won: payout is size/price, profit is payout - size
+                    pnl = (size / price) - size if price > 0 else 0
+                else:
+                    # Lost: lost the entire bet
+                    pnl = -size
+                
+                wallet_resolved_trades[wallet].append({
+                    "market_id": cid,
+                    "won": trade_won,
+                    "pnl": pnl,
+                    "timestamp": trade.get("timestamp", "")
+                })
+                
+                # Track category performance
+                track_category_performance(wallet, cid, pnl, trade_won)
+
+def get_wallet_win_rate(wallet: str) -> Dict:
+    """Get win rate for a wallet"""
+    trades = wallet_resolved_trades.get(wallet, [])
+    if not trades:
+        return {"win_rate": 0, "wins": 0, "losses": 0, "total": 0}
+    
+    wins = sum(1 for t in trades if t.get("won"))
+    total = len(trades)
+    
+    return {
+        "win_rate": wins / total if total > 0 else 0,
+        "wins": wins,
+        "losses": total - wins,
+        "total": total
+    }
+
+# ============================================
+# DETECTION FUNCTIONS
+# ============================================
+
+def detect_fresh_wallet_trade(trade: Dict) -> Optional[Dict]:
+    """Detect trades from fresh/new wallets"""
+    wallet = trade.get("wallet", "")
+    size = trade.get("size", 0)
+    
+    if size < 500:  # Only care about $500+ trades from new wallets
+        return None
+    
+    if not wallet:
+        return None
+    
+    # Check cooldown - don't alert same wallet within 10 minutes
+    last_alert = price_spike_cooldown.get(f"fresh_{wallet}")
+    if last_alert:
+        try:
+            last_time = datetime.fromisoformat(last_alert)
+            if datetime.now() - last_time < timedelta(minutes=10):
+                return None
+        except:
+            pass
+    
+    if is_fresh_wallet(wallet):
+        # Set cooldown
+        price_spike_cooldown[f"fresh_{wallet}"] = datetime.now().isoformat()
+        
+        return {
+            "type": "🆕 FRESH WALLET",
+            "message": f"New wallet trading {fmt_money(size)} on {trade.get('market', '?')}",
+            "wallet": wallet,
+            "trade": trade,
+            "sound": "insider",
+            "timestamp": datetime.now().isoformat()
+        }
+    return None
+
+def detect_price_spike(market_id: str, current_price: float) -> Optional[Dict]:
+    """Detect significant price movements"""
+    history = price_history.get(market_id, [])
+    
+    if len(history) < 5:
+        return None
+    
+    # Check cooldown - don't alert same market within 5 minutes
+    last_alert = price_spike_cooldown.get(market_id)
+    if last_alert:
+        try:
+            last_time = datetime.fromisoformat(last_alert)
+            if datetime.now() - last_time < timedelta(minutes=5):
+                return None
+        except:
+            pass
+    
+    # Compare to price ~5 entries ago (not oldest)
+    compare_idx = max(0, len(history) - 5)
+    old_entry = history[compare_idx]
+    old_price = old_entry.get("price", current_price)
+    
+    if old_price == 0 or old_price is None:
+        return None
+    
+    # Avoid division issues with very small prices
+    if old_price < 0.001:
+        return None
+    
+    change_pct = ((current_price - old_price) / old_price) * 100
+    
+    if abs(change_pct) >= CONFIG["PRICE_SPIKE_PCT"]:
+        market_data = market_cache.get(market_id, {})
+        market_name = market_data.get("question", "Unknown market")
+        direction = "📈 UP" if change_pct > 0 else "📉 DOWN"
+        
+        # Set cooldown
+        price_spike_cooldown[market_id] = datetime.now().isoformat()
+        
+        # Clean up old cooldowns
+        if len(price_spike_cooldown) > 1000:
+            price_spike_cooldown.clear()
+        
+        return {
+            "type": f"PRICE SPIKE {direction}",
+            "message": f"{market_name} moved {change_pct:+.1f}% ({fmt_price(old_price)} → {fmt_price(current_price)})",
+            "market_id": market_id,
+            "change_pct": change_pct,
+            "old_price": old_price,
+            "new_price": current_price,
+            "sound": "spike",
+            "timestamp": datetime.now().isoformat()
+        }
+    return None
+
+def detect_whale_convergence(market_id: str) -> Optional[Dict]:
+    """Detect multiple whales buying same market"""
+    recent = recent_whale_buys.get(market_id, [])
+    
+    # Filter to last 10 minutes
+    cutoff = datetime.now() - timedelta(minutes=10)
+    recent_filtered = []
+    for w, s, ts in recent:
+        try:
+            trade_time = datetime.fromisoformat(ts.replace("Z", "+00:00")).replace(tzinfo=None)
+            if trade_time > cutoff:
+                recent_filtered.append((w, s, ts))
+        except:
+            recent_filtered.append((w, s, ts))  # Keep if can't parse
+    
+    recent_whale_buys[market_id] = recent_filtered
+    
+    # Check for convergence
+    unique_whales = set(w for w, s, ts in recent_filtered)
+    
+    if len(unique_whales) >= CONFIG["CONVERGENCE_COUNT"]:
+        total_size = sum(s for w, s, ts in recent_filtered)
+        market_name = market_cache.get(market_id, {}).get("question", "Unknown")
+        
+        return {
+            "type": "🐋 WHALE CONVERGENCE",
+            "message": f"{len(unique_whales)} whales bought {fmt_money(total_size)} on {market_name}",
+            "market_id": market_id,
+            "whale_count": len(unique_whales),
+            "total_size": total_size,
+            "sound": "whale",
+            "timestamp": datetime.now().isoformat()
+        }
+    return None
+
+def detect_volume_anomaly(market_id: str, current_volume: float) -> Optional[Dict]:
+    """Detect unusual volume spikes"""
+    history = volume_history.get(market_id, [])
+    
+    if len(history) < 5:
+        return None
+    
+    # Use same cooldown as price spikes
+    last_alert = price_spike_cooldown.get(f"vol_{market_id}")
+    if last_alert:
+        try:
+            last_time = datetime.fromisoformat(last_alert)
+            if datetime.now() - last_time < timedelta(minutes=10):
+                return None
+        except:
+            pass
+    
+    # Calculate average (safely)
+    volumes = [v for t, v in history if isinstance(v, (int, float))]
+    if not volumes:
+        return None
+    
+    avg_volume = sum(volumes) / len(volumes)
+    
+    if avg_volume <= 0:
+        return None
+    
+    ratio = current_volume / avg_volume
+    
+    if ratio >= CONFIG["VOLUME_ANOMALY_MULT"]:
+        market_name = market_cache.get(market_id, {}).get("question", "Unknown")
+        
+        # Set cooldown
+        price_spike_cooldown[f"vol_{market_id}"] = datetime.now().isoformat()
+        
+        return {
+            "type": "📊 VOLUME ANOMALY",
+            "message": f"{market_name} - {ratio:.1f}x normal volume ({fmt_money(current_volume)})",
+            "market_id": market_id,
+            "ratio": ratio,
+            "sound": "spike",
+            "timestamp": datetime.now().isoformat()
+        }
+    return None
+
+# ============================================
+# ARBITRAGE FINDER
+# ============================================
+
+def find_arbitrage_opportunities(markets: List[Dict]) -> List[Dict]:
+    """Find potential arbitrage between related markets"""
+    opportunities = []
+    
+    # Group markets by similarity (simple keyword matching)
+    market_groups = defaultdict(list)
+    
+    for m in markets:
+        question = m.get("question", "").lower()
+        # Extract key terms
+        for term in ["trump", "biden", "bitcoin", "btc", "eth", "fed", "rate", "election"]:
+            if term in question:
+                market_groups[term].append(m)
+    
+    # Check for pricing inconsistencies within groups
+    for term, group in market_groups.items():
+        if len(group) < 2:
+            continue
+        
+        for i, m1 in enumerate(group):
+            for m2 in group[i+1:]:
+                # Use yes_price from market_cache (already parsed)
+                p1 = m1.get("yes_price", 0.5)
+                p2 = m2.get("yes_price", 0.5)
+                
+                # If very different prices on similar topics, flag it
+                diff = abs(p1 - p2)
+                if diff > 0.15:  # 15%+ difference
+                    opportunities.append({
+                        "market1": m1.get("question", "?"),  # No truncation
+                        "price1": p1,
+                        "market2": m2.get("question", "?"),  # No truncation
+                        "price2": p2,
+                        "diff": diff,
+                        "term": term
+                    })
+    
+    return sorted(opportunities, key=lambda x: x["diff"], reverse=True)[:5]
+
+# ============================================
+# ANALYSIS & TRACKING
+# ============================================
+
+def update_wallet_stats(trade: Dict):
+    """Update wallet statistics"""
+    wallet = trade.get("wallet", "")
+    if not wallet or wallet == "?":
+        return
+    
+    # Track first seen
+    if wallet not in wallet_first_seen:
+        wallet_first_seen[wallet] = trade.get("timestamp", datetime.now().isoformat())
+    
+    if wallet not in wallet_stats:
+        wallet_stats[wallet] = {
+            "address": wallet,
+            "total_volume": 0,
+            "buy_volume": 0,
+            "sell_volume": 0,
+            "trade_count": 0,
+            "buy_count": 0,
+            "sell_count": 0,
+            "markets_traded": [],
+            "first_seen": trade.get("timestamp", ""),
+            "last_seen": trade.get("timestamp", ""),
+            "largest_trade": 0,
+            "avg_trade_size": 0,
+        }
+    
+    stats = wallet_stats[wallet]
+    size = trade.get("size", 0)
+    side = trade.get("side", "BUY")
+    market_id = trade.get("market_id", "")
+    
+    stats["total_volume"] += size
+    stats["trade_count"] += 1
+    stats["last_seen"] = trade.get("timestamp", stats["last_seen"])
+    
+    if size > stats["largest_trade"]:
+        stats["largest_trade"] = size
+    
+    stats["avg_trade_size"] = stats["total_volume"] / stats["trade_count"]
+    
+    if side == "BUY":
+        stats["buy_volume"] += size
+        stats["buy_count"] += 1
+    else:
+        stats["sell_volume"] += size
+        stats["sell_count"] += 1
+    
+    if market_id and market_id not in stats["markets_traded"]:
+        stats["markets_traded"].append(market_id)
+        # Keep only last 100 markets to prevent unbounded growth
+        if len(stats["markets_traded"]) > 100:
+            stats["markets_traded"] = stats["markets_traded"][-100:]
+
+def update_market_sentiment(trade: Dict):
+    """Track buy/sell pressure per market"""
+    market_id = trade.get("market_id", "")
+    market_name = trade.get("market", "")
+    
+    if not market_id:
+        return
+    
+    if market_id not in market_sentiment:
+        market_sentiment[market_id] = {
+            "name": market_name,
+            "total_volume": 0,
+            "buy_volume": 0,
+            "sell_volume": 0,
+            "buy_count": 0,
+            "sell_count": 0,
+            "recent_trades": [],
+            "unique_buyers": set(),
+            "unique_sellers": set(),
+            "largest_buy": 0,
+            "largest_sell": 0,
+        }
+    
+    sent = market_sentiment[market_id]
+    size = trade.get("size", 0)
+    side = trade.get("side", "BUY")
+    wallet = trade.get("wallet", "")
+    
+    sent["name"] = market_name or sent["name"]
+    sent["total_volume"] += size
+    
+    if isinstance(sent["unique_buyers"], list):
+        sent["unique_buyers"] = set(sent["unique_buyers"])
+    if isinstance(sent["unique_sellers"], list):
+        sent["unique_sellers"] = set(sent["unique_sellers"])
+    
+    if side == "BUY":
+        sent["buy_volume"] += size
+        sent["buy_count"] += 1
+        if wallet:
+            sent["unique_buyers"].add(wallet)
+        if size > sent["largest_buy"]:
+            sent["largest_buy"] = size
+    else:
+        sent["sell_volume"] += size
+        sent["sell_count"] += 1
+        if wallet:
+            sent["unique_sellers"].add(wallet)
+        if size > sent["largest_sell"]:
+            sent["largest_sell"] = size
+    
+    sent["recent_trades"].append({
+        "wallet": wallet,
+        "side": side,
+        "size": size,
+        "price": trade.get("price", 0.5),
+        "outcome": trade.get("outcome", ""),
+        "timestamp": trade.get("timestamp", ""),
+    })
+    sent["recent_trades"] = sent["recent_trades"][-20:]
+
+def update_time_patterns(trade: Dict):
+    """Track trading patterns by time of day"""
+    try:
+        ts = trade.get("timestamp", "")
+        if ts:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            hour = dt.hour
+            hourly_volume[hour] += trade.get("size", 0)
+            hourly_trades[hour] += 1
+    except:
+        pass
+
+def process_trade(trade: Dict) -> List[Dict]:
+    """Process a trade and return any alerts"""
+    alerts_generated = []
+    
+    wallet = trade.get("wallet", "")
+    size = trade.get("size", 0)
+    market_id = trade.get("market_id", "")
+    
+    # Update all tracking
+    update_wallet_stats(trade)
+    update_market_sentiment(trade)
+    update_time_patterns(trade)
+    
+    # Track whale buys for convergence detection
+    if size >= CONFIG["WHALE_THRESHOLD"] and trade.get("side") == "BUY":
+        recent_whale_buys[market_id].append((wallet, size, trade.get("timestamp", "")))
+        
+        # Check for convergence
+        conv_alert = detect_whale_convergence(market_id)
+        if conv_alert:
+            alerts_generated.append(conv_alert)
+    
+    # Detect fresh wallet trades
+    fresh_alert = detect_fresh_wallet_trade(trade)
+    if fresh_alert:
+        alerts_generated.append(fresh_alert)
+    
+    # Calculate Unusual Activity Score (UAS)
+    if size >= 500:  # Only score significant trades
+        sentiment = market_sentiment.get(market_id, {})
+        market_data = market_cache.get(market_id, {})
+        uas_result = uas_scorer.calculate_trade_score(trade, market_data, sentiment)
+        
+        # Store in history (keep last 100)
+        trade_uas_history.append(uas_result)
+        if len(trade_uas_history) > 100:
+            trade_uas_history.pop(0)
+        
+        # Update market UAS
+        market_uas = uas_scorer.calculate_market_score(market_id)
+        market_uas_scores[market_id] = market_uas
+    
+    return alerts_generated
+
+# ============================================
+# MARKET ANALYSIS
+# ============================================
+
+def analyze_markets(markets: List[Dict]) -> Dict:
+    """Analyze markets and detect anomalies"""
+    analysis = {
+        "by_volume": [],
+        "by_volume_24h": [],
+        "tightest": [],
+        "ending_soon": [],
+        "new_markets": [],
+        "price_spikes": [],
+        "categories": defaultdict(list),
+        "hot_now": [],  # Markets with recent activity
+    }
+    
+    # Track categories for all markets
+    update_market_categories(markets)
+    
+    now = datetime.now()
+    
+    for m in markets:
+        cid = m.get("conditionId", "")
+        question = m.get("question", "?")
+        
+        try:
+            volume = float(m.get("volume") or 0)
+            volume_24h = float(m.get("volume24hr") or 0)
+            liquidity = float(m.get("liquidity") or 0)
+        except (ValueError, TypeError):
+            volume = 0
+            volume_24h = 0
+            liquidity = 0
+        
+        yes_price = parse_price(m.get("outcomePrices"))
+        
+        # Skip markets with no liquidity (dead markets)
+        if liquidity < 100:
+            continue
+        
+        # Skip markets with extreme prices (basically resolved)
+        if yes_price < 0.02 or yes_price > 0.98:
+            continue
+        
+        # Get end date to filter stale markets
+        end_date = m.get("endDate")
+        days_left = None
+        if end_date:
+            try:
+                end_dt = datetime.fromisoformat(end_date.replace("Z", "+00:00"))
+                days_left = (end_dt.replace(tzinfo=None) - now).days
+            except:
+                pass
+        
+        # Skip markets that ended or are way in the future with no activity
+        if days_left is not None:
+            if days_left < 0:  # Already ended
+                continue
+            if days_left > 365 and volume_24h < 100:  # Far future + no activity
+                continue
+        
+        # Token IDs
+        clob_ids = m.get("clobTokenIds", [])
+        if isinstance(clob_ids, str):
+            try:
+                clob_ids = json.loads(clob_ids)
+            except:
+                clob_ids = []
+        
+        created = m.get("createdAt")
+        days_old = None
+        if created:
+            try:
+                created_dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                days_old = (now - created_dt.replace(tzinfo=None)).days
+            except:
+                pass
+        
+        # Tags
+        tags = m.get("tags") or []
+        if isinstance(tags, str):
+            try:
+                tags = json.loads(tags)
+            except:
+                tags = []
+        
+        categories = []
+        for t in tags:
+            if isinstance(t, dict):
+                cat = t.get("slug") or t.get("label") or ""
+                if cat:
+                    categories.append(cat)
+            elif isinstance(t, str):
+                categories.append(t)
+        
+        market_data = {
+            "id": cid,
+            "question": question,
+            "volume": volume,
+            "volume_24h": volume_24h,
+            "liquidity": liquidity,
+            "yes_price": yes_price,
+            "days_left": days_left,
+            "days_old": days_old,
+            "categories": categories,
+            "slug": m.get("slug", ""),
+            "token_ids": clob_ids,
+        }
+        
+        # Store in cache BEFORE detecting spikes so we have the name
+        market_cache[cid] = market_data
+        
+        # Track price history
+        if cid:
+            price_history[cid].append({
+                "timestamp": now.isoformat(),
+                "price": yes_price
+            })
+            price_history[cid] = price_history[cid][-50:]
+            
+            # Track volume history
+            volume_history[cid].append((now.isoformat(), volume_24h))
+            volume_history[cid] = volume_history[cid][-20:]
+            
+            # Detect price spikes (now market_cache has the name)
+            spike = detect_price_spike(cid, yes_price)
+            if spike:
+                analysis["price_spikes"].append(spike)
+            
+            # Detect volume anomalies
+            vol_anomaly = detect_volume_anomaly(cid, volume_24h)
+            if vol_anomaly:
+                analysis["price_spikes"].append(vol_anomaly)
+        
+        # All markets with volume
+        if volume > 0:
+            analysis["by_volume"].append(market_data)
+        
+        # Markets with 24h activity (currently active) - THIS IS THE KEY FILTER
+        # Must have real recent activity to be considered "hot"
+        if volume_24h >= 500:  # At least $500 in last 24h
+            analysis["by_volume_24h"].append(market_data)
+            analysis["hot_now"].append(market_data)
+        
+        if 0.40 <= yes_price <= 0.60:
+            analysis["tightest"].append(market_data)
+        
+        if days_left is not None and 0 <= days_left <= 7:
+            analysis["ending_soon"].append(market_data)
+        
+        if days_old is not None and days_old <= 3:
+            analysis["new_markets"].append(market_data)
+        
+        for cat in categories:
+            analysis["categories"][cat].append(market_data)
+    
+    # Sort by 24h volume primarily (current activity)
+    analysis["by_volume"].sort(key=lambda x: (x["volume_24h"] or 0, x["volume"]), reverse=True)
+    analysis["by_volume_24h"].sort(key=lambda x: x["volume_24h"] or 0, reverse=True)
+    analysis["hot_now"].sort(key=lambda x: x["volume_24h"] or 0, reverse=True)
+    analysis["tightest"].sort(key=lambda x: x["volume_24h"] or x["liquidity"], reverse=True)
+    analysis["ending_soon"].sort(key=lambda x: x["days_left"] if x["days_left"] is not None else 999)
+    analysis["new_markets"].sort(key=lambda x: x["volume_24h"] or 0, reverse=True)
+    
+    return analysis
+
+def get_hot_markets(limit: int = 10) -> List[Dict]:
+    """Get markets with most trading activity - only those with real names"""
+    markets = []
+    
+    for mid, sent in market_sentiment.items():
+        name = sent.get("name", "")
+        
+        # Skip markets with no name or placeholder names
+        if not name or name == "?" or len(name) < 10:
+            continue
+        
+        # Must have some activity
+        total_vol = sent.get("total_volume", 0)
+        if total_vol < 100:
+            continue
+        
+        buyers = len(sent["unique_buyers"]) if isinstance(sent["unique_buyers"], set) else len(sent.get("unique_buyers", []))
+        sellers = len(sent["unique_sellers"]) if isinstance(sent["unique_sellers"], set) else len(sent.get("unique_sellers", []))
+        
+        markets.append({
+            "id": mid,
+            "name": name,
+            "total_volume": total_vol,
+            "buy_volume": sent.get("buy_volume", 0),
+            "sell_volume": sent.get("sell_volume", 0),
+            "buy_count": sent.get("buy_count", 0),
+            "sell_count": sent.get("sell_count", 0),
+            "unique_buyers": buyers,
+            "unique_sellers": sellers,
+            "largest_buy": sent.get("largest_buy", 0),
+            "largest_sell": sent.get("largest_sell", 0),
+        })
+    
+    markets.sort(key=lambda x: x["total_volume"], reverse=True)
+    return markets[:limit]
+
+def get_leaderboard(sort_by: str = "volume", limit: int = 20) -> List[Dict]:
+    """Get sorted wallet leaderboard"""
+    wallets = []
+    
+    for addr, stats in wallet_stats.items():
+        win_data = get_wallet_win_rate(addr)
+        wallets.append({
+            **stats,
+            "win_rate": win_data["win_rate"],
+            "wins": win_data["wins"],
+            "losses": win_data["losses"],
+            "resolved_trades": win_data["total"]
+        })
+    
+    if sort_by == "volume":
+        wallets.sort(key=lambda x: x.get("total_volume", 0), reverse=True)
+    elif sort_by == "trades":
+        wallets.sort(key=lambda x: x.get("trade_count", 0), reverse=True)
+    elif sort_by == "largest":
+        wallets.sort(key=lambda x: x.get("largest_trade", 0), reverse=True)
+    elif sort_by == "winrate":
+        wallets.sort(key=lambda x: (x.get("resolved_trades", 0) > 2, x.get("win_rate", 0)), reverse=True)
+    
+    return wallets[:limit]
+
+# ============================================
+# TRADE PROCESSING
+# ============================================
+
+def process_trades_from_markets(markets: List[Dict]) -> Tuple[List[Dict], List[Dict]]:
+    """Get trades from markets, return (trades, alerts)"""
+    new_trades = []
+    all_alerts = []
+    
+    markets_to_scan = CONFIG["MARKETS_TO_SCAN_TRADES"]
+    
+    for m in markets[:markets_to_scan]:
+        cid = m.get("id") or m.get("conditionId")
+        question = m.get("question", "?")
+        
+        if not cid:
+            continue
+        
+        trades = get_market_trades(cid, limit=20)
+        
+        for t in trades:
+            wallet = t.get("proxyWallet") or t.get("maker") or t.get("taker") or "?"
+            
+            try:
+                size = float(t.get("usdcSize") or t.get("size") or 0)
+                price = float(t.get("price") or 0.5)
+            except (ValueError, TypeError):
+                continue
+            
+            if "usdcSize" not in t and size > 0 and price > 0:
+                size = size * price
+            
+            if size < CONFIG["MIN_TRADE_SIZE"]:
+                continue
+            
+            ts = t.get("timestamp") or t.get("createdAt") or t.get("matchTime") or t.get("created_at") or ""
+            
+            # If no timestamp from API, use current time
+            if not ts:
+                ts = datetime.now().isoformat()
+            
+            trade_id = f"{ts}_{wallet}_{size:.0f}"
+            
+            if trade_id in seen_trades:
+                continue
+            seen_trades.add(trade_id)
+            
+            # ═══════════════════════════════════════════════════════════════
+            # ESSENTIAL POLYMARKET DATA - Capture ALL fields from API
+            # ═══════════════════════════════════════════════════════════════
+            
+            # Outcome details - YES/NO and specific bucket name
+            outcome = t.get("outcome") or t.get("outcomeName") or "?"
+            outcome_index = t.get("outcomeIndex")  # 0=Yes, 1=No
+            asset_id = t.get("asset") or t.get("assetId") or ""
+            
+            # Get the proper USDC size (most accurate)
+            usdc_size = t.get("usdcSize")
+            if usdc_size:
+                try:
+                    size = float(usdc_size)
+                except:
+                    pass
+            
+            # Trader profile info
+            trader_name = t.get("name") or t.get("pseudonym") or ""
+            trader_bio = t.get("bio") or ""
+            profile_image = t.get("profileImage") or t.get("profileImageOptimized") or ""
+            
+            # Market grouping info
+            event_slug = t.get("eventSlug") or ""
+            market_slug = t.get("slug") or ""
+            market_title = t.get("title") or question  # title is often better than question
+            market_icon = t.get("icon") or ""
+            
+            trade = {
+                "id": trade_id,
+                "timestamp": ts,
+                "wallet": wallet,
+                "market": market_title,
+                "market_id": cid,
+                "side": (t.get("side") or "BUY").upper(),
+                "size": size,
+                "price": price,
+                # Outcome details
+                "outcome": outcome,
+                "outcome_index": outcome_index,
+                "asset_id": asset_id,
+                # Trader info
+                "trader_name": trader_name,
+                "trader_bio": trader_bio,
+                "profile_image": profile_image,
+                # Market grouping
+                "event_slug": event_slug,
+                "market_slug": market_slug,
+                "market_icon": market_icon,
+                # Transaction details
+                "fee": t.get("fee") or t.get("feeAmount") or 0,
+                "transaction_hash": t.get("transactionHash") or t.get("txHash") or "",
+            }
+            
+            all_trades.append(trade)
+            new_trades.append(trade)
+            discovered_wallets.add(wallet)
+            
+            # Process for alerts
+            trade_alerts = process_trade(trade)
+            all_alerts.extend(trade_alerts)
+        
+        time.sleep(0.15)
+    
+    return new_trades, all_alerts
+
+def process_wallet_activity(wallets: Set[str]) -> Tuple[List[Dict], List[Dict]]:
+    """Get activity from wallets, return (trades, alerts)"""
+    new_trades = []
+    all_alerts = []
+    
+    wallets_to_scan = CONFIG["WALLETS_TO_SCAN"]
+    
+    for wallet in list(wallets)[:wallets_to_scan]:
+        activity = get_wallet_activity(wallet, limit=20)
+        
+        for a in activity:
+            if a.get("type") and a.get("type") != "TRADE":
+                continue
+            
+            try:
+                size = float(a.get("usdcSize") or a.get("size") or 0)
+                price = float(a.get("price") or 0.5)
+            except (ValueError, TypeError):
+                continue
+            
+            if "usdcSize" not in a and size > 0 and price > 0:
+                size = size * price
+            
+            if size < CONFIG["MIN_TRADE_SIZE"]:
+                continue
+            
+            ts = a.get("timestamp") or a.get("createdAt") or a.get("matchTime") or a.get("created_at") or ""
+            
+            # If no timestamp from API, use current time
+            if not ts:
+                ts = datetime.now().isoformat()
+            
+            trade_id = f"{ts}_{wallet}_{size:.0f}"
+            
+            if trade_id in seen_trades:
+                continue
+            seen_trades.add(trade_id)
+            
+            # ═══════════════════════════════════════════════════════════════
+            # ESSENTIAL POLYMARKET DATA - Capture ALL fields from API
+            # ═══════════════════════════════════════════════════════════════
+            
+            # Get the proper USDC size (most accurate)
+            usdc_size = a.get("usdcSize")
+            if usdc_size:
+                try:
+                    size = float(usdc_size)
+                except:
+                    pass
+            
+            # Outcome details
+            outcome = a.get("outcome") or a.get("outcomeName") or "?"
+            outcome_index = a.get("outcomeIndex")
+            asset_id = a.get("asset") or a.get("assetId") or ""
+            
+            # Trader profile info
+            trader_name = a.get("name") or a.get("pseudonym") or ""
+            trader_bio = a.get("bio") or ""
+            profile_image = a.get("profileImage") or a.get("profileImageOptimized") or ""
+            
+            # Market grouping info
+            event_slug = a.get("eventSlug") or ""
+            market_slug = a.get("slug") or ""
+            market_title = a.get("title") or a.get("slug") or "?"
+            market_icon = a.get("icon") or ""
+            
+            trade = {
+                "id": trade_id,
+                "timestamp": ts,
+                "wallet": wallet,
+                "market": market_title,
+                "market_id": a.get("conditionId") or "",
+                "side": (a.get("side") or "BUY").upper(),
+                "size": size,
+                "price": price,
+                # Outcome details
+                "outcome": outcome,
+                "outcome_index": outcome_index,
+                "asset_id": asset_id,
+                # Trader info
+                "trader_name": trader_name,
+                "trader_bio": trader_bio,
+                "profile_image": profile_image,
+                # Market grouping
+                "event_slug": event_slug,
+                "market_slug": market_slug,
+                "market_icon": market_icon,
+                # Transaction details
+                "fee": a.get("fee") or a.get("feeAmount") or 0,
+                "transaction_hash": a.get("transactionHash") or a.get("txHash") or "",
+            }
+            
+            all_trades.append(trade)
+            new_trades.append(trade)
+            
+            trade_alerts = process_trade(trade)
+            all_alerts.extend(trade_alerts)
+        
+        time.sleep(0.15)
+    
+    return new_trades, all_alerts
+
+def discover_wallets_from_markets(markets: List[Dict]) -> Set[str]:
+    """Find active wallets from markets"""
+    wallets = set()
+    
+    # Scan more markets for wallet discovery
+    for m in markets[:10]:
+        cid = m.get("id") or m.get("conditionId")
+        token_ids = m.get("token_ids", [])
+        
+        if not cid:
+            continue
+        
+        trades = get_market_trades(cid, limit=30)
+        for t in trades:
+            wallet = t.get("proxyWallet") or t.get("maker") or t.get("taker")
+            if wallet:
+                wallets.add(wallet)
+        
+        if token_ids and len(token_ids) > 0:
+            holders = get_market_holders(cid, token_ids[0])
+            for h in holders:
+                wallet = h.get("proxyWallet") or h.get("address") or h.get("user")
+                if wallet:
+                    wallets.add(wallet)
+        
+        time.sleep(0.2)
+    
+    return wallets
+
+# ============================================
+# DISPLAY
+# ============================================
+
+def print_section(title: str, emoji: str = ""):
+    print(f"\n{C.BOLD}{C.WHITE}{emoji} {title}{C.R}")
+    print(f"{C.GRAY}{'─'*80}{C.R}")
+
+def display_dashboard(market_analysis: Dict, new_alerts: List[Dict], new_trade_count: int):
+    print("\033[2J\033[H", end="")
+    
+    print(f"""
+{C.CYAN}╔════════════════════════════════════════════════════════════════════════════════╗
+║  📊 POLYWATCH ULTIMATE - Live Market Intelligence                               ║
+║  {datetime.now().strftime("%Y-%m-%d %H:%M:%S")}                                                            ║
+╚════════════════════════════════════════════════════════════════════════════════╝{C.R}
+""")
+
+    # ─────────────────────────────────────────
+    # ALERTS
+    # ─────────────────────────────────────────
+    if new_alerts:
+        print_section("🚨 ALERTS", "")
+        for alert in new_alerts[-10:]:  # Show more alerts
+            alert_type = alert.get("type", "ALERT")
+            msg = alert.get("message", "")
+            market_id = alert.get("market_id", "")
+            alert_time = alert.get("timestamp", "")
+            time_str = fmt_time(alert_time) if alert_time else ""
+            
+            # Get additional market data if available
+            market_data = market_cache.get(market_id, {})
+            vol_24h = market_data.get("volume_24h", 0)
+            liquidity = market_data.get("liquidity", 0)
+            
+            # Color based on alert type
+            time_prefix = f"{C.GRAY}[{time_str}]{C.R} " if time_str else ""
+            if "DOWN" in alert_type:
+                print(f"  {time_prefix}{C.BG_RED}{C.WHITE} {alert_type} {C.R} {msg}")
+            elif "UP" in alert_type:
+                print(f"  {time_prefix}{C.BG_GREEN}{C.WHITE} {alert_type} {C.R} {msg}")
+            else:
+                print(f"  {time_prefix}{C.BG_YELLOW}{C.WHITE} {alert_type} {C.R} {msg}")
+            
+            # Show additional data for price spikes
+            if "PRICE SPIKE" in alert_type and market_id:
+                sentiment_data = market_sentiment.get(market_id, {})
+                buy_vol = sentiment_data.get("buy_volume", 0)
+                sell_vol = sentiment_data.get("sell_volume", 0)
+                
+                extra_info = []
+                if vol_24h > 0:
+                    extra_info.append(f"24h Vol: {fmt_money(vol_24h)}")
+                if liquidity > 0:
+                    extra_info.append(f"Liq: {fmt_money(liquidity)}")
+                if buy_vol > 0 or sell_vol > 0:
+                    extra_info.append(f"Buy: {fmt_money(buy_vol)} / Sell: {fmt_money(sell_vol)}")
+                
+                if extra_info:
+                    print(f"       {C.GRAY}{' | '.join(extra_info)}{C.R}")
+                
+                # Show market slug/link if we have it
+                slug = market_data.get("slug", "")
+                if slug:
+                    print(f"       {C.CYAN}https://polymarket.com/event/{slug}{C.R}")
+            
+            # Show wallet for fresh wallet alerts
+            if "FRESH WALLET" in alert_type:
+                wallet = alert.get("wallet", "")
+                if wallet:
+                    print(f"       {C.CYAN}https://polymarket.com/profile/{wallet}{C.R}")
+            
+            # Show whale convergence details
+            if "CONVERGENCE" in alert_type:
+                whale_count = alert.get("whale_count", 0)
+                total_size = alert.get("total_size", 0)
+                if whale_count > 0:
+                    print(f"       {C.MAGENTA}{whale_count} whales, total: {fmt_money(total_size)}{C.R}")
+        
+        print()
+
+    # ─────────────────────────────────────────
+    # UNUSUAL ACTIVITY SCORES (UAS)
+    # ─────────────────────────────────────────
+    if trade_uas_history:
+        print_section("📊 UNUSUAL ACTIVITY SCORES - Anomaly Detection", "")
+        
+        # Show top 5 highest UAS trades
+        sorted_uas = sorted(trade_uas_history, key=lambda x: x.get("total", 0), reverse=True)[:5]
+        
+        for uas in sorted_uas:
+            score = uas.get("total", 0)
+            if score < 20:  # Skip low scores
+                continue
+                
+            trade = uas.get("trade", {})
+            components = uas.get("components", {})
+            market_id = uas.get("market_id", "")
+            
+            label = uas_scorer.get_score_label(score)
+            color = uas_scorer.get_score_color(score)
+            
+            size = trade.get("size", 0)
+            side = trade.get("side", "?")
+            wallet = trade.get("wallet", "?")
+            market = trade.get("market", "?")
+            timestamp = trade.get("timestamp", "")
+            outcome = trade.get("outcome", "?")
+            outcome_index = trade.get("outcome_index")
+            trader_name = trade.get("trader_name", "")
+            price = trade.get("price", 0)
+            time_str = fmt_time_full(timestamp)
+            
+            side_color = C.GREEN if side == "BUY" else C.RED
+            
+            # Format outcome
+            if outcome and outcome.upper() in ["YES", "NO"]:
+                outcome_display = outcome.upper()
+            elif outcome_index is not None:
+                outcome_display = "YES" if outcome_index == 0 else "NO"
+            else:
+                outcome_display = outcome.upper() if outcome else "?"
+            
+            trader_display = f" ({trader_name})" if trader_name else ""
+            
+            print(f"  {color}UAS: {score:.0f}/100 {label}{C.R}")
+            print(f"    {C.YELLOW}[{time_str}]{C.R} {side_color}{side} {outcome_display}{C.R} at {fmt_price(price)} for {fmt_money(size)}")
+            print(f"    Market: {market}")
+            print(f"    Trader: {C.CYAN}https://polymarket.com/profile/{wallet}{C.R}{trader_display}")
+            
+            # Show component breakdown for high scores
+            if score >= 40:
+                comp_str = []
+                for key, val in sorted(components.items(), key=lambda x: x[1], reverse=True)[:3]:
+                    if val >= 30:
+                        comp_str.append(f"{key.replace('_', ' ').title()}: {val:.0f}")
+                if comp_str:
+                    print(f"    {C.GRAY}Factors: {' | '.join(comp_str)}{C.R}")
+            print()
+        
+        # Show market UAS summary
+        if market_uas_scores:
+            high_uas_markets = [
+                (mid, data) for mid, data in market_uas_scores.items()
+                if data.get("total", 0) >= 40
+            ]
+            high_uas_markets.sort(key=lambda x: x[1].get("total", 0), reverse=True)
+            
+            if high_uas_markets[:3]:
+                print(f"  {C.BOLD}Markets with Elevated Activity:{C.R}")
+                for mid, data in high_uas_markets[:3]:
+                    score = data.get("total", 0)
+                    name = data.get("market_name", "?")
+                    label = uas_scorer.get_score_label(score)
+                    print(f"    {uas_scorer.get_score_color(score)}{score:.0f}{C.R} - {name}")
+                print()
+
+    # ─────────────────────────────────────────
+    # HOT RIGHT NOW - Markets with 24h activity
+    # ─────────────────────────────────────────
+    print_section("🔥 HOT RIGHT NOW - Active in Last 24h (Top 10)", "")
+    hot_now = market_analysis.get("hot_now", [])[:10]
+    
+    if hot_now:
+        for m in hot_now:
+            q = m.get("question", "Unknown")
+            vol_24h = m.get("volume_24h", 0) or 0
+            price = m.get("yes_price", 0.5) or 0.5
+            liq = m.get("liquidity", 0) or 0
+            days_left = m.get("days_left")
+            
+            # Show when market ends
+            if days_left is not None:
+                if days_left == 0:
+                    time_str = f" {C.RED}[TODAY]{C.R}"
+                elif days_left <= 1:
+                    time_str = f" {C.RED}[{days_left}d]{C.R}"
+                elif days_left <= 7:
+                    time_str = f" {C.YELLOW}[{days_left}d]{C.R}"
+                elif days_left <= 30:
+                    time_str = f" {C.GRAY}[{days_left}d]{C.R}"
+                else:
+                    time_str = ""
+            else:
+                time_str = ""
+            
+            print(f"  {C.WHITE}{q}{C.R}{time_str}")
+            print(f"    {C.CYAN}{fmt_price(price)}{C.R} YES | "
+                  f"24h: {C.YELLOW}{fmt_money(vol_24h)}{C.R} | "
+                  f"Liq: {fmt_money(liq)}")
+    else:
+        print(f"  {C.GRAY}Loading market data...{C.R}")
+
+    # ─────────────────────────────────────────
+    # WHAT PEOPLE ARE BUYING
+    # ─────────────────────────────────────────
+    print_section("WHAT PEOPLE ARE BUYING - Trade Flow (Top 10)", "🎯")
+    hot_markets = get_hot_markets(10)
+    
+    if hot_markets:
+        for m in hot_markets:
+            name = m.get("name", "")
+            if not name or name == "?":
+                continue
+            
+            total_vol = m.get("total_volume", 0) or 0
+            buy_vol = m.get("buy_volume", 0) or 0
+            sell_vol = m.get("sell_volume", 0) or 0
+            buyers = m.get("unique_buyers", 0) or 0
+            
+            if total_vol > 0:
+                buy_pct = (buy_vol / total_vol) * 100
+            else:
+                buy_pct = 50
+            
+            if buy_pct >= 70:
+                sentiment = f"{C.GREEN}BULLISH 🟢{C.R}"
+            elif buy_pct <= 30:
+                sentiment = f"{C.RED}BEARISH 🔴{C.R}"
+            else:
+                sentiment = f"{C.YELLOW}MIXED ⚖️{C.R}"
+            
+            print(f"  {C.WHITE}{name}{C.R}")
+            print(f"    {C.GREEN}BUY: {fmt_money(buy_vol)}{C.R} vs {C.RED}SELL: {fmt_money(sell_vol)}{C.R} | "
+                  f"{buyers} buyers | {sentiment}")
+    else:
+        print(f"  {C.GRAY}Collecting data...{C.R}")
+
+    # ─────────────────────────────────────────
+    # ENDING SOON - Time sensitive markets
+    # ─────────────────────────────────────────
+    ending_soon = [m for m in market_analysis.get("ending_soon", []) if (m.get("volume_24h") or 0) >= 100]
+    if ending_soon:
+        print_section("⏰ ENDING SOON - Time Sensitive (Top 10)", "")
+        for m in ending_soon[:10]:
+            q = m.get("question", "Unknown")
+            price = m.get("yes_price", 0.5) or 0.5
+            vol_24h = m.get("volume_24h", 0) or 0
+            days_left = m.get("days_left")
+            
+            days_str = f"{days_left}d" if days_left is not None else "?"
+            urgency = C.RED if days_left is not None and days_left <= 1 else C.YELLOW
+            print(f"  {urgency}[{days_str}]{C.R} {fmt_price(price)} - {q}")
+            print(f"       24h Vol: {fmt_money(vol_24h)}")
+
+    # ─────────────────────────────────────────
+    # BIGGEST BETS
+    # ─────────────────────────────────────────
+    print_section("BIGGEST BETS BEING PLACED (Top 10)", "💎")
+    big_trades = sorted(all_trades, key=lambda t: t.get("size", 0), reverse=True)[:10]
+    
+    for t in big_trades:
+        size = t.get("size", 0)
+        if size < 500:
+            continue
+        
+        side = t.get("side", "?")
+        market = t.get("market", "?")
+        wallet = t.get("wallet", "?")
+        price = t.get("price", 0)
+        timestamp = t.get("timestamp", "")
+        outcome = t.get("outcome", "?")
+        outcome_index = t.get("outcome_index")
+        event_slug = t.get("event_slug", "")
+        trader_name = t.get("trader_name", "")
+        tx_hash = t.get("transaction_hash", "")
+        
+        side_color = C.GREEN if side == "BUY" else C.RED
+        whale = " 🐋" if size >= 5000 else ""
+        fresh = " 🆕" if is_fresh_wallet(wallet) else ""
+        time_str = fmt_time_full(timestamp)
+        
+        # Format outcome display - show YES/NO clearly
+        if outcome and outcome.upper() in ["YES", "NO"]:
+            outcome_display = outcome.upper()
+        elif outcome_index is not None:
+            outcome_display = "YES" if outcome_index == 0 else "NO"
+        else:
+            outcome_display = outcome.upper() if outcome else "?"
+        
+        # Win rate
+        win_data = get_wallet_win_rate(wallet)
+        win_str = f" ({win_data['win_rate']:.0%} WR)" if win_data['total'] >= 3 else ""
+        
+        # Trader name display
+        trader_display = f" ({trader_name})" if trader_name else ""
+        
+        # Potential payout calculation
+        payout_str = ""
+        if side == "BUY" and price > 0.01 and price < 1.0:
+            potential_payout = size / price
+            profit = potential_payout - size
+            payout_str = f"→ Win: ${potential_payout:,.0f} (+${profit:,.0f})"
+        elif side == "SELL" and price > 0.01:
+            payout_str = f"→ Keep: ${size:,.0f} if loses"
+        
+        print(f"  {C.YELLOW}[{time_str}]{C.R}")
+        print(f"    {side_color}{side} {outcome_display}{C.R} at {fmt_price(price)} for {C.WHITE}{fmt_money(size)}{whale}{C.R}")
+        print(f"    Market: {market}")
+        print(f"    Trader: {C.CYAN}https://polymarket.com/profile/{wallet}{C.R}{trader_display}{fresh}{win_str}")
+        if payout_str:
+            print(f"    {C.GRAY}{payout_str}{C.R}")
+        if tx_hash:
+            print(f"    {C.GRAY}Tx: https://polygonscan.com/tx/{tx_hash}{C.R}")
+        print()
+
+    # ─────────────────────────────────────────
+    # RECENT TRADES (by time)
+    # ─────────────────────────────────────────
+    print_section("RECENT TRADES (Latest First)", "🕐")
+    
+    # Sort by timestamp, most recent first
+    recent_trades = sorted(
+        [t for t in all_trades if t.get("timestamp")],
+        key=lambda t: t.get("timestamp", ""),
+        reverse=True
+    )[:10]
+    
+    for t in recent_trades:
+        size = t.get("size", 0)
+        side = t.get("side", "?")
+        market = t.get("market", "?")
+        wallet = t.get("wallet", "?")
+        price = t.get("price", 0)
+        timestamp = t.get("timestamp", "")
+        outcome = t.get("outcome", "?")
+        outcome_index = t.get("outcome_index")
+        trader_name = t.get("trader_name", "")
+        
+        side_color = C.GREEN if side == "BUY" else C.RED
+        time_str = fmt_time_full(timestamp)
+        whale = " 🐋" if size >= 5000 else ""
+        fresh = " 🆕" if is_fresh_wallet(wallet) else ""
+        
+        # Format outcome display
+        if outcome and outcome.upper() in ["YES", "NO"]:
+            outcome_display = outcome.upper()
+        elif outcome_index is not None:
+            outcome_display = "YES" if outcome_index == 0 else "NO"
+        else:
+            outcome_display = outcome.upper() if outcome else "?"
+        
+        # Trader name display
+        trader_display = f" ({trader_name})" if trader_name else ""
+        
+        print(f"  {C.YELLOW}[{time_str}]{C.R} {side_color}{side} {outcome_display}{C.R} at {fmt_price(price)} for {fmt_money(size)}{whale}")
+        print(f"    {market}")
+        print(f"    {C.CYAN}https://polymarket.com/profile/{wallet}{C.R}{trader_display}{fresh}")
+
+    # ─────────────────────────────────────────
+    # COPY TRADING SIGNALS (Using Official Leaderboard)
+    # ─────────────────────────────────────────
+    print_section("🧠 COPY TRADING - TOP PROFITABLE TRADERS", "")
+    
+    # Get top profitable traders from official API
+    top_pnl = get_polymarket_leaderboard(category="OVERALL", time_period="WEEK", order_by="PNL", limit=10)
+    
+    if top_pnl:
+        print(f"  {C.BOLD}📊 Weekly P&L Leaders (Official Polymarket Data){C.R}")
+        print()
+        
+        for trader in top_pnl[:5]:
+            rank = trader.get("rank", "?")
+            wallet = trader.get("proxyWallet", "")
+            username = trader.get("userName", "")
+            pnl = trader.get("pnl", 0) or 0
+            vol = trader.get("vol", 0) or 0
+            x_user = trader.get("xUsername", "")
+            verified = "✓" if trader.get("verifiedBadge") else ""
+            
+            # Color based on profit
+            pnl_color = C.GREEN if pnl >= 0 else C.RED
+            pnl_sign = "+" if pnl >= 0 else ""
+            
+            # Name display
+            name_display = username if username else f"{wallet[:12]}..."
+            if verified:
+                name_display = f"{name_display} {verified}"
+            
+            print(f"  #{rank} {C.WHITE}{name_display}{C.R}")
+            print(f"      {pnl_color}P&L: {pnl_sign}${pnl:,.0f}{C.R} | Volume: ${vol:,.0f}")
+            
+            # Show their recent trades if we have them
+            recent = [t for t in all_trades if t.get("wallet") == wallet]
+            if recent:
+                last = recent[-1]
+                time_str = fmt_time_full(last.get('timestamp', ''))
+                side = last.get('side', '?')
+                side_color = C.GREEN if side == "BUY" else C.RED
+                print(f"      Latest [{C.YELLOW}{time_str}{C.R}]: {side_color}{side}{C.R} ${last.get('size', 0):,.0f}")
+                print(f"      {last.get('market', '?')[:60]}")
+            
+            # Show X/Twitter if available
+            if x_user:
+                print(f"      {C.GRAY}Twitter: @{x_user}{C.R}")
+            
+            print(f"      {C.CYAN}https://polymarket.com/profile/{wallet}{C.R}")
+            print()
+        
+        # Show category leaders
+        print(f"  {C.BOLD}🏆 Category Leaders (Weekly){C.R}")
+        categories = ["POLITICS", "CRYPTO", "SPORTS"]
+        for cat in categories:
+            cat_leaders = get_polymarket_leaderboard(category=cat, time_period="WEEK", order_by="PNL", limit=1)
+            if cat_leaders:
+                leader = cat_leaders[0]
+                name = leader.get("userName") or leader.get("proxyWallet", "")[:12]
+                pnl = leader.get("pnl", 0) or 0
+                pnl_color = C.GREEN if pnl >= 0 else C.RED
+                print(f"    {cat.title()}: {C.WHITE}{name}{C.R} {pnl_color}+${pnl:,.0f}{C.R}")
+    else:
+        # Fallback to local tracking
+        top_winners = get_leaderboard("winrate", 10)
+        
+        shown = 0
+        for w in top_winners:
+            if w.get("resolved_trades", 0) < 3:
+                continue
+            if shown >= 5:
+                break
+            
+            addr = w.get("address", "?")
+            wr = w.get("win_rate", 0)
+            wins = w.get("wins", 0)
+            total = w.get("resolved_trades", 0)
+            vol = w.get("total_volume", 0)
+            
+            # Get their recent trade
+            recent = [t for t in all_trades if t.get("wallet") == addr]
+            if recent:
+                last = recent[-1]
+                time_str = fmt_time_full(last.get('timestamp', ''))
+                print(f"  {C.GREEN}{wr:.0%} WIN RATE{C.R} ({wins}/{total}) - Vol: {fmt_money(vol)}")
+                print(f"    Latest [{C.YELLOW}{time_str}{C.R}]: {last.get('side')} {fmt_money(last.get('size', 0))}")
+                print(f"    {last.get('market', '?')}")
+                print(f"    {C.CYAN}https://polymarket.com/profile/{addr}{C.R}")
+                print()
+                shown += 1
+        
+        if shown == 0:
+            print(f"  {C.GRAY}Loading leaderboard data...{C.R}")
+
+    # ─────────────────────────────────────────
+    # TRADER PNL INSIGHTS (NEW!)
+    # ─────────────────────────────────────────
+    # Show P&L for top wallets we've seen recently
+    try:
+        big_wallet_trades = sorted(all_trades, key=lambda t: t.get("size", 0), reverse=True)[:20]
+        unique_big_wallets = list(dict.fromkeys(t.get("wallet") for t in big_wallet_trades if t.get("wallet")))[:3]
+        
+        if unique_big_wallets:
+            print_section("💰 TRADER P&L INSIGHTS - Live Positions", "")
+            
+            shown_pnl = 0
+            for wallet in unique_big_wallets:
+                try:
+                    pnl_data = get_wallet_pnl(wallet)
+                    
+                    if pnl_data.get("position_count", 0) == 0:
+                        continue
+                    
+                    total_pnl = pnl_data.get("total_pnl", 0)
+                    realized = pnl_data.get("realized_pnl", 0)
+                    unrealized = pnl_data.get("unrealized_pnl", 0)
+                    
+                    # Color based on profit/loss
+                    pnl_color = C.GREEN if total_pnl >= 0 else C.RED
+                    pnl_sign = "+" if total_pnl >= 0 else ""
+                    
+                    # Get trader name if we have it
+                    trader_trades = [t for t in all_trades if t.get("wallet") == wallet]
+                    trader_name = ""
+                    if trader_trades:
+                        trader_name = trader_trades[0].get("trader_name", "")
+                    
+                    name_display = f" ({trader_name})" if trader_name else ""
+                    
+                    print(f"  {C.BOLD}Trader:{C.R} {wallet[:20]}...{name_display}")
+                    print(f"    {pnl_color}Total P&L: {pnl_sign}${total_pnl:,.2f}{C.R}")
+                    print(f"    Realized: ${realized:,.2f} | Unrealized: ${unrealized:,.2f}")
+                    print(f"    Open Positions: {pnl_data.get('position_count', 0)}")
+                    
+                    # Show top positions
+                    positions = pnl_data.get("positions", [])
+                    if positions:
+                        top_pos = sorted(positions, key=lambda p: abs(p.get("cash_pnl", 0)), reverse=True)[:2]
+                        for pos in top_pos:
+                            pos_pnl = pos.get("cash_pnl", 0)
+                            pos_color = C.GREEN if pos_pnl >= 0 else C.RED
+                            pos_sign = "+" if pos_pnl >= 0 else ""
+                            print(f"      {pos_color}{pos_sign}${pos_pnl:,.0f}{C.R} on {pos.get('outcome', '?')} - {pos.get('market', '?')[:50]}")
+                    
+                    # Show category breakdown if we have it
+                    cat_stats = get_wallet_category_stats(wallet)
+                    if cat_stats:
+                        top_cats = sorted(cat_stats.values(), key=lambda x: x.get("trade_count", 0), reverse=True)[:3]
+                        if top_cats:
+                            cat_str = " | ".join([
+                                f"{c.get('category', '?').title()}: {c.get('win_rate', 0):.0%}" 
+                                for c in top_cats if c.get("trade_count", 0) >= 2
+                            ])
+                            if cat_str:
+                                print(f"    {C.GRAY}Category WR: {cat_str}{C.R}")
+                    
+                    print(f"    {C.CYAN}https://polymarket.com/profile/{wallet}{C.R}")
+                    print()
+                    shown_pnl += 1
+                except Exception as e:
+                    log(f"Error displaying PnL for {wallet[:10]}: {e}", "debug")
+                    continue
+            
+            if shown_pnl == 0:
+                print(f"  {C.GRAY}No position data available yet{C.R}")
+    except Exception as e:
+        log(f"Error in PnL insights section: {e}", "debug")
+
+    # ─────────────────────────────────────────
+    # NEW MARKETS (EARLY EDGE)
+    # ─────────────────────────────────────────
+    if market_analysis.get("new_markets"):
+        print_section("NEW MARKETS - EARLY EDGE OPPORTUNITIES (Top 5)", "🆕")
+        for m in market_analysis["new_markets"][:5]:
+            q = m.get("question", "Unknown")
+            price = m.get("yes_price", 0.5) or 0.5
+            liq = m.get("liquidity", 0) or 0
+            days = m.get("days_old")
+            days_str = f"{days}d old" if days is not None else "new"
+            print(f"  {C.MAGENTA}[{days_str}]{C.R} {fmt_price(price)} - {q}")
+            print(f"    Liquidity: {fmt_money(liq)}")
+
+    # ─────────────────────────────────────────
+    # ARBITRAGE OPPORTUNITIES
+    # ─────────────────────────────────────────
+    arb = find_arbitrage_opportunities(list(market_cache.values()))
+    if arb:
+        print_section("POTENTIAL ARBITRAGE", "⚖️")
+        for a in arb[:3]:
+            term = a.get('term', '?').upper()
+            p1 = a.get('price1', 0)
+            p2 = a.get('price2', 0)
+            diff = a.get('diff', 0)
+            m1 = a.get('market1', '?')
+            m2 = a.get('market2', '?')
+            print(f"  {C.YELLOW}{term}{C.R}: {fmt_price(p1)} vs {fmt_price(p2)} ({diff*100:.0f}% diff)")
+            print(f"    {m1}")
+            print(f"    {m2}")
+
+    # ─────────────────────────────────────────
+    # LEADERBOARD (Official Polymarket Data)
+    # ─────────────────────────────────────────
+    print_section("🏆 OFFICIAL POLYMARKET LEADERBOARD", "")
+    
+    # Get top volume traders from official API
+    top_vol_official = get_polymarket_leaderboard(category="OVERALL", time_period="WEEK", order_by="VOL", limit=10)
+    
+    if top_vol_official:
+        print(f"  {C.BOLD}Top Volume Traders (Weekly){C.R}")
+        for trader in top_vol_official[:5]:
+            rank = trader.get("rank", "?")
+            wallet = trader.get("proxyWallet", "")
+            username = trader.get("userName", "")
+            pnl = trader.get("pnl", 0) or 0
+            vol = trader.get("vol", 0) or 0
+            verified = "✓" if trader.get("verifiedBadge") else ""
+            
+            name_display = username if username else f"{wallet[:12]}..."
+            pnl_color = C.GREEN if pnl >= 0 else C.RED
+            pnl_sign = "+" if pnl >= 0 else ""
+            
+            print(f"    #{rank} {C.WHITE}{name_display}{verified}{C.R} - Vol: {C.CYAN}${vol:,.0f}{C.R} | {pnl_color}{pnl_sign}${pnl:,.0f}{C.R}")
+    else:
+        # Fallback to local tracking
+        top_volume = get_leaderboard("volume", 10)
+        
+        for i, w in enumerate(top_volume, 1):
+            addr = w.get("address", "?")
+            vol = w.get("total_volume", 0)
+            trades = w.get("trade_count", 0)
+            wr = w.get("win_rate", 0)
+            wr_str = f" | {wr:.0%} WR" if w.get("resolved_trades", 0) >= 3 else ""
+            fresh = " 🆕" if is_fresh_wallet(addr) else ""
+            
+            print(f"  #{i} Vol: {C.GREEN}{fmt_money(vol)}{C.R} | {trades} trades{wr_str}{fresh}")
+            print(f"     {C.CYAN}https://polymarket.com/profile/{addr}{C.R}")
+
+    # ─────────────────────────────────────────
+    # TIME PATTERNS
+    # ─────────────────────────────────────────
+    if sum(hourly_trades.values()) > 50:
+        print_section("TRADING TIME PATTERNS (UTC)", "⏰")
+        
+        # Find peak hours
+        peak_hours = sorted(hourly_trades.items(), key=lambda x: x[1], reverse=True)[:3]
+        quiet_hours = sorted(hourly_trades.items(), key=lambda x: x[1])[:3]
+        
+        peak_str = ", ".join([f"{h}:00 ({c} trades)" for h, c in peak_hours])
+        quiet_str = ", ".join([f"{h}:00" for h, c in quiet_hours if c > 0])
+        
+        print(f"  {C.GREEN}Peak hours:{C.R} {peak_str}")
+        if quiet_str:
+            print(f"  {C.GRAY}Quiet hours:{C.R} {quiet_str}")
+
+    # ─────────────────────────────────────────
+    # WHALE WATCH
+    # ─────────────────────────────────────────
+    print_section("WHALE ACTIVITY (Top 5)", "🐋")
+    whales = get_leaderboard("largest", 5)
+    
+    for w in whales:
+        largest = w.get("largest_trade", 0)
+        if largest >= 1000:
+            addr = w.get("address", "?")
+            fresh = " 🆕 FRESH WALLET" if is_fresh_wallet(addr) else ""
+            print(f"  Largest: {C.MAGENTA}{fmt_money(largest)}{C.R} | Total: {fmt_money(w.get('total_volume', 0))}{fresh}")
+            print(f"  {C.CYAN}https://polymarket.com/profile/{addr}{C.R}")
+
+    # Footer
+    hot_count = len(market_analysis.get("hot_now", []))
+    total_markets = len(market_analysis.get("by_volume", []))
+    ending_count = len(market_analysis.get("ending_soon", []))
+    print(f"\n{C.GRAY}{'─'*80}")
+    print(f"  Markets: {total_markets} total | {hot_count} hot (24h active) | {ending_count} ending soon")
+    print(f"  Trades: {len(all_trades)} | Wallets: {len(wallet_stats)} | Alerts: {len(alerts)} | New: {new_trade_count}")
+    print(f"  Commands: Press Ctrl+C to quit | Data auto-saves every cycle")
+    print(f"{'─'*80}{C.R}")
+
+# ============================================
+# MAIN
+# ============================================
+
+def poll_cycle():
+    global loop_count
+    loop_count += 1
+    
+    all_alerts = []
+    
+    # Cleanup seen_trades to prevent unbounded memory growth
+    if len(seen_trades) > 10000:
+        seen_trades.clear()
+    
+    # Limit all_trades to prevent memory issues
+    if len(all_trades) > 5000:
+        all_trades[:] = all_trades[-2500:]
+    
+    # 1. Get and analyze markets
+    markets = get_markets()
+    if not markets:
+        log("No markets returned!", "error")
+        return
+    
+    market_analysis = analyze_markets(markets)
+    
+    # Add any price spike alerts
+    all_alerts.extend(market_analysis.get("price_spikes", []))
+    
+    # 2. Get trades from top markets (use 24h active markets first)
+    markets_to_scan = market_analysis.get("hot_now", []) or market_analysis["by_volume"]
+    new_from_markets, market_alerts = process_trades_from_markets(markets_to_scan)
+    all_alerts.extend(market_alerts)
+    
+    # 3. Discover wallets every 3rd cycle (always on first cycle)
+    if loop_count % 3 == 1 or loop_count == 1:
+        active_markets = market_analysis.get("hot_now", [])[:10] or market_analysis["by_volume"][:10]
+        new_wallets = discover_wallets_from_markets(active_markets)
+        discovered_wallets.update(new_wallets)
+        log(f"Discovered {len(new_wallets)} new wallets (total: {len(discovered_wallets)})", "info")
+    
+    # 4. Get wallet activity
+    if discovered_wallets:
+        new_from_wallets, wallet_alerts = process_wallet_activity(discovered_wallets)
+        all_alerts.extend(wallet_alerts)
+    else:
+        new_from_wallets = []
+    
+    # 5. Check resolved markets for win rate tracking
+    if loop_count % 5 == 0:
+        check_resolved_markets()
+    
+    total_new = len(new_from_markets) + len(new_from_wallets)
+    
+    # Broadcast important alerts
+    for alert in all_alerts:
+        broadcast_alert(alert)
+    
+    # Display
+    display_dashboard(market_analysis, all_alerts, total_new)
+    
+    # Save
+    if loop_count % 2 == 0:
+        save_all_data()
+        try:
+            Path("polywatch-trades.json").write_text(json.dumps(all_trades[-500:], indent=2))
+        except:
+            pass
+
+
+def main():
+    print("\033[2J\033[H", end="")
+    
+    print(f"""
+{C.CYAN}╔════════════════════════════════════════════════════════════════════════════════╗
+║                                                                                  ║
+║   📊  POLYWATCH ULTIMATE                                                         ║
+║   Polymarket Intelligence Scanner - FULL MARKET COVERAGE                         ║
+║                                                                                  ║
+║   Features:                                                                      ║
+║   📡 Scans ALL markets (not just top 100)                                        ║
+║   🆕 Fresh wallet detection      📈 Price spike alerts                           ║
+║   🐋 Whale convergence           📊 Volume anomalies                             ║
+║   🏆 Win rate tracking           🧠 Copy trading signals                         ║
+║   ⏰ Time patterns               📁 CSV export                                   ║
+║   🔔 Discord/Telegram webhooks   🔊 Sound alerts                                 ║
+║                                                                                  ║
+╚════════════════════════════════════════════════════════════════════════════════╝{C.R}
+""")
+    
+    # Config webhooks
+    if CONFIG["DISCORD_WEBHOOK"]:
+        log("Discord webhook configured", "success")
+    if CONFIG["TELEGRAM_BOT_TOKEN"]:
+        log("Telegram bot configured", "success")
+    
+    log("Loading saved data...", "info")
+    load_all_data()
+    
+    log("Testing API connection...", "info")
+    test = api_get(f"{CONFIG['GAMMA_API']}/markets", {"limit": "1"})
+    if not test:
+        log("Cannot connect to Polymarket API!", "error")
+        input("\nPress Enter to exit...")
+        return
+    log("Connected!", "success")
+    
+    time.sleep(2)
+    
+    print(f"\n{C.YELLOW}TIP: Configure webhooks in CONFIG dict for Discord/Telegram alerts{C.R}")
+    print(f"{C.YELLOW}TIP: Run export_trades_csv() or export_leaderboard_csv() to export data{C.R}\n")
+    
+    time.sleep(2)
+    
+    while True:
+        try:
+            poll_cycle()
+            log(f"Next refresh in {CONFIG['POLL_INTERVAL_SEC']}s... (Ctrl+C to quit)", "info")
+            time.sleep(CONFIG["POLL_INTERVAL_SEC"])
+        except KeyboardInterrupt:
+            print(f"\n{C.YELLOW}Saving data and exiting...{C.R}")
+            save_all_data()
+            
+            # Offer export
+            try:
+                resp = input(f"\n{C.CYAN}Export data to CSV? (y/n): {C.R}").strip().lower()
+                if resp == 'y':
+                    export_trades_csv()
+                    export_leaderboard_csv()
+            except:
+                pass
+            
+            log(f"Saved {len(all_trades)} trades, {len(wallet_stats)} wallets", "success")
+            break
+        except Exception as e:
+            log(f"Error: {e}", "error")
+            import traceback
+            traceback.print_exc()
+            time.sleep(5)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as e:
+        print(f"\n\nERROR: {e}")
+        import traceback
+        traceback.print_exc()
+        input("\nPress Enter to exit...")
